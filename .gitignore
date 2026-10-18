@@ -1,0 +1,24 @@
+# secrets
+.env
+.env.*
+!.env.example
+
+# dependencies and build output
+node_modules/
+dist/
+dist-ssr/
+
+# python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# too large for GitHub, kept on this machine
+nltk_data/
+*.mp4
+*.onnx
+*.trie
+wsl启动rag项目/
+.DS_Store
