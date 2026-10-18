@@ -2,7 +2,7 @@ version: '3.8'
 services:
   swxy_api:
     build:
-      context: ./app
+      context: .
       dockerfile: Dockerfile
     hostname: swxy_api
     container_name: swxy_api
@@ -21,9 +21,9 @@ services:
     ports:
       - "8000:8000"  # 只保留应用服务的端口映射
     volumes:
-      - ./app:/app/app
+      - ./app:/app
       - ./nltk_data:/usr/local/nltk_data
-    command: ["uvicorn", "app_main:app", "--host", "0.0.0.0", "--port", "8000"]
+    command: ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
     restart: unless-stopped
     depends_on:
       - gsk_pg
