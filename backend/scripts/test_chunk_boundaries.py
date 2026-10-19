@@ -39,6 +39,24 @@ def test_merge_keeps_page_spanning_box_with_next_page():
     assert len(naive_merge(sections, 128)) == 1
 
 
+def test_merge_continues_sentence_across_pages():
+    sections = [
+        ("上网电量1958.01亿千瓦时，可比", tag(2, 42, 543, 760, 790)),
+        ("口径同比下降1.96%；光伏发电量同比+122.55%。", tag(3, 42, 543, 60, 90)),
+    ]
+    assert len(naive_merge(sections, 128)) == 1
+
+
+def test_merge_breaks_after_glyph_at_page_end():
+    sections = [
+        ("风险提示：新品孵化风险。", tag(1, 200, 500, 528, 539)),
+        ("\uf0d8", tag(1, 185, 191, 529, 536)),
+        ("证券分析师声明", tag(3, 42, 117, 79, 91)),
+    ]
+    chunks = naive_merge(sections, 128)
+    assert len(chunks) == 2 and chunks[1].startswith("证券分析师声明"), chunks
+
+
 def test_merge_without_positions_unchanged():
     assert naive_merge(["一段。", "两段。"], 128) == ["一段。两段。"]
 
@@ -83,6 +101,7 @@ def test_real_pdf(path):
 
 if __name__ == "__main__":
     tests = [test_merge_breaks_at_page_change, test_merge_keeps_page_spanning_box_with_next_page,
+             test_merge_continues_sentence_across_pages, test_merge_breaks_after_glyph_at_page_end,
              test_merge_without_positions_unchanged, test_sidebar_ordered_after_main_column,
              test_single_column_page_unchanged]
     if len(sys.argv) > 1:

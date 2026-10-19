@@ -95,16 +95,18 @@ def naive_merge(sections, chunk_token_num=128, delimiter="\n。；！？"):
         sections = [(s, "") for s in sections]
     cks = [""]
     tk_nums = [0]
-    last_page = None
+    last_page, last_text = None, ""
 
     def add_chunk(t, pos):
-        nonlocal cks, tk_nums, delimiter, last_page
+        nonlocal cks, tk_nums, delimiter, last_page, last_text
         tnum = num_tokens_from_string(t)
         pages = _tag_pages(pos)
-        # 解析器已经把跨页续写的段落合成一个框，这里换页就是内容换了，不能拼进同一块
-        new_page = bool(pages) and last_page is not None and pages[0] != last_page
+        # 换页时上一段停在句子中间就接着拼，否则是换了内容（如正文结束后接免责声明），另起一块
+        mid_sentence = re.search(r"[\u4e00-\u9fffA-Za-z0-9，、；：,;:（(“\"-]$", last_text.strip())
+        new_page = bool(pages) and last_page is not None and pages[0] != last_page and not mid_sentence
         if pages:
             last_page = pages[-1]
+        last_text = t
         if not pos:
             pos = ""
         if tnum < 8:
