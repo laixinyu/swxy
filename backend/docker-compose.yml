@@ -19,7 +19,9 @@ services:
     env_file:
       - .env
     ports:
-      - "8000:8000"  # 只保留应用服务的端口映射
+      # 只监听本机。Docker 发布的端口会绕过 ufw，写成 "8000:8000" 会直接暴露到公网。
+      # 前端开发服务器在宿主机上通过 127.0.0.1:8000 访问后端。
+      - "127.0.0.1:8000:8000"
     volumes:
       - ./app:/app
       - ./nltk_data:/usr/local/nltk_data
