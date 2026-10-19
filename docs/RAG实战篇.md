@@ -165,6 +165,28 @@ for i, c in enumerate(cks):
 
 这类问题会让块的向量变“脏”，但通常不至于找不到答案。如果是扫描件、复杂排版的 PDF，解析问题会严重得多。
 
+**用画框图直观地看解析过程。** DeepDoc 自带三个可视化工具，会把识别结果画在每一页的图片上：
+
+```bash
+PDF=/app/engine/storage/file/1/润本股份.pdf
+
+# 版面识别：每个区域被识别成了正文、标题、表格、图、页眉还是页脚
+docker exec -w /app swxy_api python -m engine.deepdoc.vision.t_recognizer --inputs=$PDF --mode=layout --output_dir=/tmp/vis/layout
+
+# OCR：每一行文字的位置和识别结果（同时生成 .txt 文本）
+docker exec -w /app swxy_api python -m engine.deepdoc.vision.t_ocr --inputs=$PDF --output_dir=/tmp/vis/ocr
+
+# 表格结构识别：行、列、表头、合并单元格（同时生成 .html 表格）。适合输入裁好的表格截图
+docker exec -w /app swxy_api python -m engine.deepdoc.vision.t_recognizer --inputs=$PDF --mode=tsr --output_dir=/tmp/vis/tsr
+
+# 把结果从容器里拷出来查看
+docker cp swxy_api:/tmp/vis /tmp/deepdoc_vis
+```
+
+`--inputs` 也可以是一个目录，或者 PNG、JPG 图片。每页输出一张 `文件名_页码.jpg`。版面识别模式下，可以加 `--threshold=0.2` 显示更多低置信度的框。
+
+拿润本股份的第 1 页看，左侧栏的“证券分析师 / 丁一 / SAC：S1350524040003”被识别成了一个独立的正文区域，紧挨着右侧的“渠道方面”段落。从位置上看，上面第 1 块开头混进分析师信息，很可能就是纵向合并时把这两块接在了一起。
+
 ### 1.6 常见症状对照表
 
 | 症状 | 最可能的原因 | 怎么确认 | 怎么改 |
