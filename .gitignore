@@ -2,6 +2,7 @@
 .env
 .env.*
 !.env.example
+frontend/certs/
 
 # dependencies and build output
 node_modules/

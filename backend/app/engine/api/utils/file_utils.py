@@ -17,3 +17,9 @@ def get_project_base_directory(*args):
     if args:
         return os.path.join(PROJECT_BASE, *args)
     return PROJECT_BASE
+
+
+def traversal_files(base):
+    for root, _, files in os.walk(base):
+        for name in files:
+            yield os.path.join(root, name)

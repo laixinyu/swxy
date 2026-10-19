@@ -41,5 +41,5 @@ COPY app/ /app/
 RUN chmod -R 755 /app
 RUN chmod +x /app/start.sh
 
-# 设置启动脚本为入口点
-ENTRYPOINT ["/app/start.sh"]
+# 通过 bash 启动。compose 会把 ./app 挂载到 /app，宿主文件是 644，直接 exec 会 permission denied。
+ENTRYPOINT ["bash", "/app/start.sh"]

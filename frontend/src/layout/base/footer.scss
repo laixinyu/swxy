@@ -1,65 +1,57 @@
 .base-layout-footer {
   flex-shrink: 0;
-  align-self: center;
   display: flex;
-  justify-content: center;
-  position: relative;
+  align-items: center;
+  gap: 10px;
+  margin-top: auto;
+  padding: 12px 14px;
+  border-top: 1px solid rgba(0, 0, 0, 0.08);
+  background: rgba(255, 255, 255, 0.86);
 
-  .base-layout-footer__bg {
-    width: 170px;
-    height: 200px;
+  .avatar {
+    flex-shrink: 0;
+    background: #e9eff5;
+    color: var(--ant-color-primary);
+    font-weight: 600;
   }
 
-  .base-layout-footer__main {
-    position: absolute;
-    top: 0;
-    left: 0;
-    right: 0;
-    bottom: 0;
-    padding: 12px;
+  .meta {
+    min-width: 0;
     display: flex;
     flex-direction: column;
-    gap: 7px;
-    color: white;
+    align-items: flex-start;
+  }
 
-    .header {
-      flex-shrink: 0;
-      display: flex;
-      justify-content: space-between;
-      align-items: flex-start;
-      gap: 12px;
+  .username {
+    max-width: 100%;
+    color: #1f1f1f;
+    font-size: 14px;
+    font-weight: 600;
+    line-height: 20px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
 
-      .avatar {
-        background-color: #e9eff5;
-        border-color: white;
-        color: var(--ant-color-primary);
+  .logout {
+    margin: 0;
+    padding: 4px 0;
+    min-height: 28px;
+    border: 0;
+    background: transparent;
+    color: #595959;
+    font-size: 13px;
+    line-height: 20px;
+    cursor: pointer;
 
-        .ant-avatar-string {
-          font-size: 28px;
-          font-weight: bold;
-        }
-      }
-
-      .edit {
-        width: 16px;
-        height: 16px;
-        cursor: pointer;
-        &:hover {
-          background-color: rgba(white, 0.2);
-        }
-      }
+    &:hover {
+      color: #d4380d;
     }
 
-    .body {
-      flex-grow: 1;
-      overflow: auto;
-    }
-
-    .footer {
-      flex-shrink: 0;
-      display: flex;
-      justify-content: space-between;
-      gap: 12px;
+    &:focus-visible {
+      outline: 2px solid var(--ant-color-primary);
+      outline-offset: 2px;
+      border-radius: 4px;
     }
   }
 }

@@ -31,8 +31,7 @@ def init_in_out(args):
     images = []
     outputs = []
 
-    if not os.path.exists(args.output_dir):
-        os.mkdir(args.output_dir)
+    os.makedirs(args.output_dir, exist_ok=True)
 
     def pdf_pages(fnm, zoomin=3):
         nonlocal outputs, images

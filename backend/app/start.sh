@@ -61,5 +61,7 @@ except Exception as e:
     print('警告: 迁移失败，但应用将继续启动')
 "
 
+python -c "import websockets" 2>/dev/null || pip install --disable-pip-version-check websockets==13.1
+
 echo "启动应用服务..."
 exec "$@" 

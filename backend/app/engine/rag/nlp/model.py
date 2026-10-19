@@ -1,5 +1,5 @@
 from openai import OpenAI
-import dashscope
+import httpx
 import numpy as np
 from typing import List
 
@@ -30,7 +30,7 @@ def get_chat_completion_block(session_id, question, references):
     
         # 调用模型生成回答
         completion = client.chat.completions.create(
-            model="deepseek-r1",
+            model="gpt-6.1-sol",
             messages=[{"role": "user", "content": prompt}],
             stream=False,
         )
@@ -41,104 +41,110 @@ def get_chat_completion_block(session_id, question, references):
         return f"Error: {str(e)}"
 
 def rerank_similarity(query, texts):
-    api_key = os.getenv("DASHSCOPE_API_KEY")
     texts = list(texts)
-
-    # === 重排前：输入顺序（按 sres.ids 排序） ===
-    print(f"\n[rerank_similarity] query={query[:60]!r} n_texts={len(texts)}")
-    print(f"[rerank_similarity] 重排前（输入顺序）:")
-    for i, t in enumerate(texts):
-        print(f"  texts[{i}]: {t[:60]!r}")
-
-    # 直接调 DashScope rerank,用 result.index 回填到原序数组
-    resp = dashscope.TextReRank.call(
-        model="gte-rerank",
-        top_n=len(texts),
-        query=query,
-        documents=texts,
-        api_key=api_key,
-    )
-
     scores = np.zeros(len(texts), dtype=float)
-    for r in resp.output.results:
-        scores[r.index] = r.relevance_score
+    if not texts:
+        return scores, None
 
-    # === 重排后：按 rerank 分数降序的新排名 ===
-    print(f"[rerank_similarity] 重排后（按 rerank 分数降序）:")
-    for rank, r in enumerate(resp.output.results):
-        snippet = texts[r.index][:60]
-        print(f"  rank {rank}: orig_idx={r.index}  score={r.relevance_score:.4f}  text={snippet!r}")
-    print(f"[rerank_similarity] 对齐后 scores（与 texts 同序）={np.round(scores, 4).tolist()}\n")
+    # 和向量同一个百炼北京密钥。对话中转站的密钥不能拿来重排。
+    api_key = os.getenv("RERANK_API_KEY") or os.getenv("EMBEDDING_API_KEY")
+    if not api_key:
+        print("[rerank_similarity] 未配置百炼密钥，保留向量召回顺序")
+        return scores, None
 
+    model = os.getenv("RERANK_MODEL", "qwen3.7-text-rerank")
+    url = os.getenv(
+        "RERANK_URL",
+        "https://dashscope.aliyuncs.com/api/v1/services/rerank/text-rerank/text-rerank",
+    )
+    documents = [text[:12000] for text in texts]
+    body = {
+        "model": model,
+        "input": {"query": query[:12000], "documents": documents},
+        "parameters": {
+            "top_n": len(documents),
+            "instruct": "Given a web search query, retrieve relevant passages that answer the query.",
+        },
+    }
+    try:
+        response = httpx.post(
+            url,
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json=body,
+            timeout=20,
+        )
+        payload = response.json()
+    except Exception as e:
+        print(f"[rerank_similarity] 重排失败，保留向量召回顺序: {e}")
+        return scores, None
+
+    results = ((payload.get("output") or {}).get("results")) if response.status_code < 400 else None
+    if not results:
+        message = payload.get("message") or payload.get("code") or response.status_code
+        print(f"[rerank_similarity] 重排失败，保留向量召回顺序: {message}")
+        return scores, None
+
+    for item in results:
+        index = item.get("index")
+        if index is None or index >= len(scores):
+            continue
+        scores[index] = float(item.get("relevance_score") or 0)
     return scores, None
 
 
 
 
-def generate_embedding(text: str | List[str], api_key: str = None, base_url: str = None, model_name: str = "text-embedding-v3", dimensions: int = 1024, encoding_format: str = "float", max_batch_size: int = 10):
-    """
-    生成文本的向量嵌入
-    
-    Args:
-        text: 单个文本或文本列表
-        api_key: API密钥
-        base_url: API基础URL
-        model_name: 模型名称
-        dimensions: 向量维度
-        encoding_format: 编码格式
-        max_batch_size: 最大批量大小，默认为10（阿里云DashScope限制）
-    
-    Returns:
-        单个文本时返回向量，文本列表时返回向量列表
-    """
-    api_key = os.getenv("DASHSCOPE_API_KEY")
-    base_url = os.getenv("DASHSCOPE_BASE_URL")    
-
-    # 初始化 OpenAI 客户端
-    client = OpenAI(
-        api_key=api_key,
-        base_url=base_url
+def _embedding_client():
+    """向量走阿里云百炼北京地域，和对话用的中转站分开。"""
+    api_key = os.getenv("EMBEDDING_API_KEY")
+    base_url = os.getenv(
+        "EMBEDDING_BASE_URL",
+        "https://dashscope.aliyuncs.com/compatible-mode/v1",
     )
+    if not api_key:
+        raise RuntimeError("未配置 EMBEDDING_API_KEY，向量模型需要阿里云百炼（北京）的 API Key")
+    return OpenAI(api_key=api_key, base_url=base_url, timeout=20)
 
-    # 如果是单个文本，直接处理
+
+def generate_embedding(text: str | List[str], api_key: str = None, base_url: str = None, model_name: str = "qwen3.7-text-embedding", dimensions: int = 1024, encoding_format: str = "float", max_batch_size: int = 10):
+    """
+    用阿里云百炼 qwen3.7-text-embedding 生成向量。
+    默认 1024 维，和现有 Elasticsearch 字段 q_1024_vec 一致。
+    该模型单批最多 20 条，这里按 10 条分批。
+    """
+    model_name = os.getenv("EMBEDDING_MODEL", model_name)
+    client = _embedding_client()
+
+    def _create(payload):
+        completion = client.embeddings.create(
+            model=model_name,
+            input=payload,
+            dimensions=dimensions,
+            encoding_format=encoding_format,
+        )
+        return completion
+
     if isinstance(text, str):
         try:
-            completion = client.embeddings.create(
-                model=model_name,
-                input=text,
-                dimensions=dimensions,
-                encoding_format=encoding_format
-            )
+            completion = _create(text)
             return completion.data[0].embedding
         except Exception as e:
-            print(f"OpenAI API 请求失败: {e}")
-            return None
-    
-    # 如果是文本列表，需要分批处理
+            raise RuntimeError(f"向量生成失败: {e}") from e
+
     if isinstance(text, list):
         all_embeddings = []
-        
-        # 分批处理
         for i in range(0, len(text), max_batch_size):
             batch = text[i:i + max_batch_size]
-            
             try:
-                completion = client.embeddings.create(
-                    model=model_name,
-                    input=batch,
-                    dimensions=dimensions,
-                    encoding_format=encoding_format
-                )
-                
-                # 收集这一批的向量
-                batch_embeddings = [item.embedding for item in completion.data]
-                all_embeddings.extend(batch_embeddings)
-                
+                completion = _create(batch)
+                all_embeddings.extend(item.embedding for item in completion.data)
             except Exception as e:
-                print(f"OpenAI API 批量请求失败 (batch {i//max_batch_size + 1}): {e}")
-                # 如果批量失败，为这一批添加空向量
-                all_embeddings.extend([None] * len(batch))
-        
+                raise RuntimeError(
+                    f"向量批量生成失败 (batch {i // max_batch_size + 1}): {e}"
+                ) from e
         return all_embeddings
 
 

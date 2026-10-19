@@ -1,6 +1,6 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from api import chat, user, history
+from api import asr, chat, user, history
 import os
 
 # 从环境变量获取 root_path
@@ -20,6 +20,7 @@ app.add_middleware(
 app.include_router(chat.router)
 app.include_router(user.router)
 app.include_router(history.router)
+app.include_router(asr.router)
 
 if __name__=='__main__':
     import uvicorn

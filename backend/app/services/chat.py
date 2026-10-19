@@ -89,7 +89,7 @@ def generate_recommended_questions(user_question, retrieved_content=None, sessio
                 base_url=os.getenv("DASHSCOPE_BASE_URL")
             )
         completion = client.chat.completions.create(
-            model="qwen2.5-7b-instruct",
+            model="gpt-6.1-sol",
             messages=[{"role": "user", "content": prompt}],
             response_format={"type": "json_object"},
             stream=False,
@@ -165,7 +165,7 @@ def generate_session_name(user_question):
                 base_url=os.getenv("DASHSCOPE_BASE_URL")
             )
         completion = client.chat.completions.create(
-            model="qwen2.5-72b-instruct",
+            model="gpt-6.1-sol",
             messages=[{"role": "user", "content": prompt}],
             response_format={"type": "json_object"},
             stream=False,
@@ -352,7 +352,7 @@ def get_chat_completion(session_id, question, retrieved_content, user_id):
 
         # 创建聊天完成请求
         completion = client.chat.completions.create(
-            model="deepseek-r1",  # 可按需更换模型名称
+            model="gpt-6.1-sol",
             messages=[
                 {"role": "user", "content": prompt}
             ],
@@ -445,20 +445,22 @@ def get_chat_completion(session_id, question, retrieved_content, user_id):
             else:
                 # 实时输出消息
                 delta = chunk.choices[0].delta
-                if delta.content:
-                    model_answer += delta.content  # 累加大模型的回答
+                content = getattr(delta, "content", None) or ""
+                reasoning = getattr(delta, "reasoning_content", None) or ""
+                if content:
+                    model_answer += content
                     message = {
                         "role": "assistant",
-                        "content": delta.content,
+                        "content": content,
                         "thinking": False,
                     }
                     json_message = json.dumps(message)
                     yield f"event: message\ndata: {json_message}\n\n"
-                else:
-                    think += delta.reasoning_content
+                elif reasoning:
+                    think += reasoning
                     message = {
                         "role": "assistant",
-                        "content": delta.reasoning_content,
+                        "content": reasoning,
                         "thinking": True,
                     }
                     json_message = json.dumps(message)

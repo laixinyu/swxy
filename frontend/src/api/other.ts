@@ -3,9 +3,9 @@ import { request } from './request'
 
 export function getVolcToken(
   params: {
-    appid: string
-    accessKey: string
-  },
+    appid?: string
+    accessKey?: string
+  } = {},
   options?: AxiosRequestConfig,
 ) {
   const { appid, accessKey } = params

@@ -5,6 +5,7 @@ from services.auth import authenticate, register_user
 from pydantic import BaseModel
 import httpx
 import asyncio
+import os
 
 router = APIRouter()
 
@@ -58,22 +59,31 @@ async def register(request: RegisterRequest):
 
 # 定义 STS Token 请求体的 Pydantic 模型
 class STSTokenRequest(BaseModel):
-    appid: str
-    accessKey: str
+    appid: str | None = None
+    accessKey: str | None = None
 
 # STS Token 接口
 @router.post("/sts-token")
-async def get_sts_token(request: STSTokenRequest):
+async def get_sts_token(request: STSTokenRequest | None = None):
     try:
+        request = request or STSTokenRequest()
+        appid = (request.appid or os.getenv("VOLC_APP_ID") or "").strip()
+        access_key = (request.accessKey or os.getenv("VOLC_ACCESS_KEY") or "").strip()
+        if not appid or not access_key:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="未配置语音识别。请在后端环境变量中设置 VOLC_APP_ID 和 VOLC_ACCESS_KEY",
+            )
+
         # 构造请求头
         headers = {
-            "Authorization": f"Bearer; {request.accessKey}",
+            "Authorization": f"Bearer; {access_key}",
             "Content-Type": "application/json"
         }
         
         # 构造请求体
         body = {
-            "appid": request.appid,
+            "appid": appid,
             "duration": 300
         }
         
@@ -88,7 +98,9 @@ async def get_sts_token(request: STSTokenRequest):
             
             # 返回原始响应
             return response.json()
-            
+
+    except HTTPException:
+        raise
     except httpx.TimeoutException:
         raise HTTPException(
             status_code=status.HTTP_408_REQUEST_TIMEOUT,

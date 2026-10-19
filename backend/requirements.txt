@@ -48,3 +48,4 @@ redis==5.0.1
 aioredis==2.0.1
 alembic==1.13.1
 sqlalchemy==1.4.53
+websockets==13.1

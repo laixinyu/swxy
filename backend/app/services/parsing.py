@@ -25,13 +25,10 @@ def batch_generate_embeddings(texts: List[str], batch_size: int = 10) -> List[Li
     Returns:
         向量列表
     """
-    try:
-        # 直接使用批量处理功能
-        embeddings = generate_embedding(texts)
-        return embeddings if embeddings is not None else []
-    except Exception as e:
-        print(f"批量生成向量失败: {e}")
-        return []
+    embeddings = generate_embedding(texts)
+    if not embeddings:
+        raise RuntimeError("批量生成向量失败")
+    return embeddings
 
 def process_items(items: List[Dict[str, Any]], file_name: str, index_name: str) -> List[Dict[str, Any]]:
     """
@@ -50,6 +47,8 @@ def process_items(items: List[Dict[str, Any]], file_name: str, index_name: str) 
         texts = [item["content_with_weight"] for item in items]
         # 批量生成向量
         embeddings = batch_generate_embeddings(texts)
+        if not embeddings or len(embeddings) != len(texts) or any(item is None for item in embeddings):
+            raise RuntimeError("向量生成失败，文档未写入")
         
         # 处理每个数据项
         results = []
@@ -86,7 +85,7 @@ def process_items(items: List[Dict[str, Any]], file_name: str, index_name: str) 
 
     except Exception as e:
         print(f"process_items error: {e}")
-        return []
+        raise
 
 def execute_insert_process(file_path: str, file_name: str, index_name: str):
     """
