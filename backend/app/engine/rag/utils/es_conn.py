@@ -27,11 +27,8 @@ from engine.rag.utils import singleton
 from engine.api.utils.file_utils import get_project_base_directory
 from engine.rag.utils.doc_store_conn import MatchExpr, OrderByExpr, MatchTextExpr, MatchDenseExpr, FusionExpr
 from engine.rag.nlp import is_english
-from dotenv import load_dotenv
+from core.config import settings
 
-load_dotenv()
-
-ES_HOST = os.getenv("ES_HOST", "http://localhost:9200")
 ATTEMPT_TIME = 2
 PAGERANK_FLD = "pagerank_fea"
 TAG_FLD = "tag_feas"
@@ -43,17 +40,45 @@ logger = logging.getLogger('ragflow.es_conn')
 class ESConnection():
     def __init__(self):
         self.info = {}
-        logger.info(f"Connecting to Elasticsearch at {ES_HOST}")
+        logger.info(f"Connecting to Elasticsearch at {settings.es_host}")
         self.es = Elasticsearch(
-            [ES_HOST],  # Elasticsearch URL
-            basic_auth=("elastic", "infini_rag_flow"),  # 用户名和密码
-            verify_certs=False,  # 禁用 SSL 证书验证
-            timeout=600
+            [settings.es_host],
+            basic_auth=(settings.es_user, settings.elastic_password),
+            verify_certs=False,
+            request_timeout=settings.es_timeout,
         )
-        logger.info("Elasticsearch connection established")
 
         fp_mapping = os.path.join(get_project_base_directory(), "conf", "mapping.json")
-        self.mapping = json.load(open(fp_mapping, "r"))
+        with open(fp_mapping, "r") as f:
+            self.mapping = json.load(f)
+        self._ready_indices = set()
+
+    def ensure_index(self, indexName: str) -> None:
+        """按 conf/mapping.json 建索引。不能依赖写入时自动建索引，否则分词字段会被默认分析器拆成单字。"""
+        if indexName in self._ready_indices:
+            return
+        if not self.es.indices.exists(index=indexName):
+            try:
+                self.es.indices.create(index=indexName, settings=self.mapping["settings"],
+                                       mappings=self.mapping["mappings"])
+                logger.info("Created index %s from mapping.json", indexName)
+            except Exception as e:
+                if "resource_already_exists_exception" not in str(e):
+                    raise
+        self._ready_indices.add(indexName)
+
+    def ping(self) -> bool:
+        return bool(self.es.ping())
+
+    def refresh(self, indexName: str) -> None:
+        self.es.indices.refresh(index=indexName)
+
+    def delete_by_doc(self, indexName: str, doc_id: str) -> int:
+        if not self.es.indices.exists(index=indexName):
+            return 0
+        res = self.es.delete_by_query(index=indexName, query={"term": {"doc_id": doc_id}},
+                                      refresh=True, conflicts="proceed")
+        return res.get("deleted", 0)
 
 
     """
@@ -135,6 +160,7 @@ class ESConnection():
     """
     def insert(self, documents: list[dict], indexName: str, knowledgebaseId: str = None) -> list[str]:
         # Refers to https://www.elastic.co/guide/en/elasticsearch/reference/current/docs-bulk.html
+        self.ensure_index(indexName)
         operations = []
         for d in documents:
             assert "_id" not in d
@@ -211,6 +237,10 @@ class ESConnection():
                 raise Exception(
                     f"Condition `{str(k)}={str(v)}` value type is {str(type(v))}, expected to be int, str or list.")
 
+        # kNN 只能带结构化过滤（kb_id、doc_id 等）。如果把下面的 query_string 也放进去，
+        # 只有关键词先命中的块才有资格参加向量检索，换了说法的问题就找不回来。
+        knn_filter = Q("bool", filter=list(bqry.filter)).to_dict() if bqry.filter else None
+
         s = Search()
         vector_similarity_weight = 0.5
         for m in matchExprs:
@@ -236,13 +266,10 @@ class ESConnection():
                 similarity = 0.0
                 if "similarity" in m.extra_options:
                     similarity = m.extra_options["similarity"]
-                s = s.knn(m.vector_column_name,
-                          m.topn,
-                          m.topn * 2,
-                          query_vector=list(m.embedding_data),
-                          filter=bqry.to_dict(),
-                          similarity=similarity,
-                          )
+                knn_options = {"query_vector": list(m.embedding_data), "similarity": similarity}
+                if knn_filter:
+                    knn_options["filter"] = knn_filter
+                s = s.knn(m.vector_column_name, m.topn, m.topn * 2, **knn_options)
 
         if bqry and rank_feature:
             for fld, sc in rank_feature.items():
@@ -338,10 +365,8 @@ class ESConnection():
                     # 精确匹配
                     query["query"]["bool"]["must"].append({"term": {field: value}})
             
-            # 打印调试信息
-            print(f"ES 删除查询: {json.dumps(query, ensure_ascii=False, indent=2)}")
-            print(f"索引名: {indexName}")
-            
+            logger.debug("ES delete query on %s: %s", indexName, json.dumps(query, ensure_ascii=False))
+
             # 执行删除
             response = self.es.delete_by_query(
                 index=indexName,
@@ -349,11 +374,8 @@ class ESConnection():
                 refresh=True
             )
             
-            print(f"ES 删除响应: {response}")
-            
             return response["deleted"]
             
         except Exception as e:
             logger.error(f"Failed to delete documents: {str(e)}")
-            print(f"ES 删除失败: {str(e)}")
             return 0

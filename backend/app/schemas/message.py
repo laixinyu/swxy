@@ -14,13 +14,21 @@ class MessageResponse(BaseModel):
     recommended_questions: Optional[Union[list, dict]] = None
     think: Optional[str] 
 
-    class Config:
-        orm_mode = True
+    model_config = {"from_attributes": True}
 
 # 定义返回的文档模型
 class FilestResponse(BaseModel):
+    id: str
     user_id: str
     file_name: str
+    file_size: int = 0
+    # pending / parsing / done / failed
+    status: str
+    chunk_count: int = 0
+    # 0～1
+    progress: float = 0
+    progress_msg: Optional[str] = None
+    error: Optional[str] = None
     created_at: str
     updated_at: str
 

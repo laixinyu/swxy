@@ -36,48 +36,62 @@ flowchart TD
 
 ### 1.1 第一步：看大模型实际收到了什么
 
-后端会把每次发给大模型的完整提示词打印到日志里（[`services/chat.py` 第 344 行](../backend/app/services/chat.py#L344) 的 `print(prompt)`）。先在页面上问一次，然后：
+每轮问答保存时，会把**发给大模型的参考内容原样存下来**（`messages` 表的 `documents` 字段），编号和提示词里的 `[0]`、`[1]` 一一对应。先在页面上问一次，然后看最近一条：
 
 ```bash
-docker logs swxy_api 2>&1 | grep -A 25 "参考内容" | tail -40
+docker exec -w /app swxy_api python -c "
+import json, logging; logging.disable(logging.CRITICAL)
+from db.database import SessionLocal
+from models import Message
+m = SessionLocal().query(Message).order_by(Message.created_at.desc()).first()
+print('问题:', m.user_question)
+print('实际检索的问题:', m.retrieval_query)
+for i, d in enumerate(json.loads(m.documents or '[]')):
+    print(f'[{i}]', d['document_name'], '|', d['content_with_weight'][:80].replace(chr(10), ' '))
+"
 ```
 
-你会看到类似这样的内容：
+实测输出（一个用户问“2025年上半年国电电力营业净利润增速怎样？”）：
 
 ```
-**参考内容：**
-**知识库内容：**
-[1] 25H1公司加大品牌广宣力度，销售费用率小幅提升。25H1公司毛利率同比+0.4pct至59.0%……
-[2] <table><caption>附录：财务预测摘要资产负债表（百万元）</caption>……
+问题: 2025年上半年国电电力营业净利润增速怎样？
+实际检索的问题: 2025年上半年国电电力营业净利润增速怎样？
+[0] 国电电力.pdf | 国电电力（600795.SH）优于大市25H1扣非归母净利润同比+56%，未来三年现金分红规划发布……
+[1] 国电电力.pdf | 营业收入同比下降，扣非归母净利润大幅增长。2025年上半年，公司实现营业收入776.55亿元……
+[2] 国电电力.pdf | <table><caption>财务预测与估值</caption> ……
 ……
-**用户问题：**
-润本股份的毛利率是多少
 ```
+
+想看完整的提示词（包括系统消息），在 `backend/.env` 里设 `LOG_LEVEL=DEBUG` 后重启后端，日志里会打印每次发给大模型的消息。平时不要开，日志里会出现大量文档原文。
+
+      
 
 **怎么判断：**
 
-- **答案在这 5 块里，但回答错了** → 是 ④ 生成的问题。看 [1.6](#16-常见症状对照表)。
-- **答案不在这 5 块里** → 是检索或更前面的问题，继续看 1.2。
+- **“实际检索的问题”和用户原问题意思不一样** → 追问改写偏了，检索的方向一开始就错了。看 [1.6](#16-常见症状对照表) 的“追问时答非所问”。
+- **答案在这几块里，但回答错了** → 是 ④ 生成的问题。看 [1.6](#16-常见症状对照表)。
+- **答案不在这几块里** → 是检索或更前面的问题，继续看 1.2。
 
 ### 1.2 第二步：看检索找到了哪 5 块、各得多少分
 
 ```bash
 docker exec -w /app swxy_api python -c "
 import logging; logging.disable(logging.CRITICAL)
+from core.config import settings
 from services.retrieval import dealer
-r = dealer.retrieval(question='润本股份的毛利率是多少', embd_mdl=None, tenant_ids='1',
-                     kb_ids=None, vector_similarity_weight=0.6, page=1, page_size=5)
+r = dealer.retrieval(question='润本股份的毛利率是多少', embd_mdl=None, tenant_ids=settings.es_index,
+                     kb_ids=['1'], vector_similarity_weight=0.6, page=1, page_size=5)
 for c in r['chunks']:
     print('总分', round(float(c['similarity']),2), '关键词', round(float(c['term_similarity']),2),
           '重排', round(float(c['vector_similarity']),2), c['content_with_weight'][:40].replace(chr(10),' '))
 "
 ```
 
-把 `question` 换成用户的原问题，`tenant_ids` 换成用户 ID。
+把 `question` 换成用户的原问题，`kb_ids` 换成用户 ID。
 
 **怎么判断：**
 
-- **“重排”那一列全是 0** → 重排接口调用失败了，排序只剩关键词分，很容易混进别的文档。查日志 `docker logs swxy_api 2>&1 | grep 重排失败`，通常是密钥、额度或网络问题。
+- **“重排”那一列全是 0** → 重排接口调用失败了，排序只剩关键词分，很容易混进别的文档。查日志 `docker compose logs swxy_api | grep 重排失败`（在 `backend/` 目录下执行），通常是密钥、额度或网络问题。
 - **重排分正常，但前 5 里没有答案** → 用 1.3 的方法判断是粗筛没找到，还是重排没排上。
 
 ### 1.3 第三步：判断是“粗筛没找到”还是“重排没排上”
@@ -90,14 +104,14 @@ cat > /tmp/one.json <<'EOF'
 EOF
 docker cp /tmp/one.json swxy_api:/tmp/one.json
 docker cp backend/scripts/. swxy_api:/tmp/scripts
-docker exec -w /app swxy_api python /tmp/scripts/eval_retrieval.py /tmp/one.json --index 1
+docker exec -w /app swxy_api python /tmp/scripts/eval_retrieval.py /tmp/one.json --user 1
 ```
 
 `answer` 填答案所在块里**一定会出现的一小段原文**（比如一个数字），`doc` 填文档名的一部分。输出：
 
 ```
 结果            粗筛名次    最终名次  问题
-命中               1       1  润本股份的毛利率是多少   (候选 50 条)
+命中               2       1  润本股份的毛利率是多少   (候选 60 条)
 ```
 
 （中文字符宽度不一，终端里表头可能和数字对不齐，不影响阅读。）
@@ -110,22 +124,27 @@ docker exec -w /app swxy_api python /tmp/scripts/eval_retrieval.py /tmp/one.json
 | 重排没排上 | 粗筛找到了，但重排后掉出了前 5 | 重排、或者关键词分把它拉下去了。可以试着调高 `vector_similarity_weight` |
 | 粗筛没找到 | 128 条候选里就没有 | 关键词过滤太严，或者向量不像。见 [代码走读 2.4](./RAG系统核心模块深入篇.md#24-关键词和向量一起查-es) |
 
-**另外注意“候选 N 条”。** 正常情况下，候选数接近 128（或接近库里的总块数）。如果候选数很少，说明关键词过滤把大部分块挡在了门外。实测例子：“婴童护肤品牌的赚钱能力怎么样”只有 **8 条候选**，因为问题里的词和原文几乎不重合。这就是 [代码走读 2.4](./RAG系统核心模块深入篇.md#24-关键词和向量一起查-es) 讲的“向量检索被关键词卡住”。
+**另外注意“候选 N 条”。** 正常情况下，候选数接近 128（库里的块不到 128 时，接近这个用户的总块数）。如果候选数明显偏少，说明有块被过滤掉了，先检查这些块是不是属于这个用户、状态是否可用。以前关键词条件也会过滤向量检索，“婴童护肤品牌的赚钱能力怎么样”只有 8 条候选；修复后是 59 条（见 [代码走读 2.4](./RAG系统核心模块深入篇.md#24-关键词和向量一起查-es)）。
 
 ### 1.4 第四步：看块本身对不对
 
-**看某个文档已经入库的所有块：**
+**看某个文档已经入库的所有块（按页码排序）：**
+
+`kb_id` 填用户 ID，`docnm_kwd` 填完整文件名。
 
 ```bash
 docker exec swxy_api python -c "
-import re
-from elasticsearch import Elasticsearch
-es = Elasticsearch(['http://es01:9200'], basic_auth=('elastic','infini_rag_flow'))
-hits = es.search(index='1', size=200, query={'match_phrase': {'docnm': '润本股份.pdf'}},
-                 _source=['content_with_weight'])['hits']['hits']
+import re, logging; logging.disable(logging.CRITICAL)
+from core.config import settings
+from engine.rag.utils.es_conn import ESConnection
+hits = ESConnection().es.search(index=settings.es_index, size=200,
+    query={'bool': {'filter': [{'term': {'kb_id': '1'}}, {'term': {'docnm_kwd': '润本股份.pdf'}}]}},
+    sort=[{'page_num_int': {'order': 'asc', 'unmapped_type': 'integer'}}],
+    _source=['content_with_weight', 'page_num_int'])['hits']['hits']
 for i, h in enumerate(hits):
     text = re.sub(r'<[^>]+>', ' ', h['_source']['content_with_weight'])
-    print(f'--- 第 {i} 块 ---'); print(re.sub(r'\s+', ' ', text)[:300])
+    page = h['_source'].get('page_num_int')
+    print(f'--- 第 {i} 块，第 {page} 页 ---'); print(re.sub(r'\s+', ' ', text)[:300])
 "
 ```
 
@@ -137,13 +156,15 @@ for i, h in enumerate(hits):
 
 ### 1.5 第五步：看解析结果
 
-不写入 ES，只跑一遍“解析 + 切块”，看 PDF 被读成了什么样（大约十几秒）：
+不写入 ES，只跑一遍“解析 + 切块”，看 PDF 被读成了什么样（大约十几秒）。原始文件存在 `/data/files/{用户}/{文档ID}.扩展名`，先从数据库查出路径：
 
 ```bash
+PDF=$(docker exec gsk_pg psql -U postgres -d gsk -tA -c "select '/data/files/' || storage_path from documents where file_name = '润本股份.pdf'")
+
 docker exec -w /app swxy_api python -c "
 import logging, re; logging.disable(logging.CRITICAL)
 from engine.rag.app.naive import chunk
-cks = chunk('/app/engine/storage/file/1/润本股份.pdf', callback=lambda prog=None, msg='': None, section_only=True)
+cks = chunk('$PDF', callback=lambda prog=None, msg='': None, section_only=True)
 for i, c in enumerate(cks):
     print(f'--- 第 {i} 块 ---'); print(re.sub(r'@@[0-9-]+\t[0-9.\t]+##', '', c)[:300])
 "
@@ -168,7 +189,7 @@ for i, c in enumerate(cks):
 **用画框图直观地看解析过程。** DeepDoc 自带三个可视化工具，会把识别结果画在每一页的图片上：
 
 ```bash
-PDF=/app/engine/storage/file/1/润本股份.pdf
+# PDF 变量的取法见上一条命令
 
 # 版面识别：每个区域被识别成了正文、标题、表格、图、页眉还是页脚
 docker exec -w /app swxy_api python -m engine.deepdoc.vision.t_recognizer --inputs=$PDF --mode=layout --output_dir=/tmp/vis/layout
@@ -191,15 +212,17 @@ docker cp swxy_api:/tmp/vis /tmp/deepdoc_vis
 
 | 症状 | 最可能的原因 | 怎么确认 | 怎么改 |
 |---|---|---|---|
-| 答非所问，说“暂无相关参考内容” | 检索失败，或者该用户没有上传文档 | 日志里搜 `检索到`，看是不是 0 条 | 确认文档已上传、ES 正常 |
+| 答非所问，说“暂无相关参考内容” | 检索失败，或者该用户的文档还没解析完 | 知识库页看文档状态；日志里搜 `检索`，看命中块数和报错 | 等解析完成；确认 `/readyz` 正常 |
+| 知识库里的文档一直是“排队中” | worker 没在运行 | `docker compose ps` 看 `swxy_worker`；`docker compose logs swxy_worker` | `docker compose up -d swxy_worker` |
+| 文档状态是“异常” | 解析或向量化失败 | 鼠标移到状态上看原因；`docker compose logs swxy_worker` 看完整报错 | 文件损坏就换一份；接口失败就查密钥和额度，删掉后重传 |
 | 把 A 公司的数据安到 B 公司头上 | 重排失败，或者参考里混了别的文档 | 1.2 看重排分是不是全 0 | 修重排；或者调高 `similarity_threshold` 过滤低分块 |
-| 换个说法问就找不到 | 关键词过滤卡住了向量检索 | 1.3 看候选数是不是很少 | 修 [代码走读 2.4 的问题一](./RAG系统核心模块深入篇.md#24-关键词和向量一起查-es) |
+| 换个说法问就找不到 | 向量和问题不够像，或者重排没排上来 | 1.3 看是粗筛没找到还是重排没排上 | 补同义词词典；调高 `VECTOR_SIMILARITY_WEIGHT` |
 | 问表格里的某个数字，答不准 | 大表格整张一块，或者表格解析错乱 | 1.4 看表格块 | 大表格按行拆成多块 |
-| 答案里有，但模型说“没有提到” | 模型漏看了；或者参考里噪声太多 | 1.1 看提示词 | 减少 `page_size`；过滤免责声明等噪声块 |
-| 模型编造了参考资料里没有的数字 | 幻觉 | 1.1 对照提示词 | 在提示词里加强“只能根据参考内容回答，没有就说不知道” |
-| 追问“那它呢”答不上来 | 只支持单轮问答 | 1.1 看提示词里没有历史对话 | 见 [3.2](#32-第二阶段补齐核心能力) 的问题改写 |
-| 引用角标点开是另一条 | 引用编号错位一位 | — | 见 [代码走读 2.9](./RAG系统核心模块深入篇.md#29-前端渲染引用角标) |
-| 引用卡片的页码是 `-` | 页码没有存进 ES | — | 见 [代码走读 1.6](./RAG系统核心模块深入篇.md#16-组装成-es-文档并写入) |
+| 答案里有，但模型说“没有提到” | 模型漏看了；或者参考里噪声太多 | 1.1 看参考内容 | 减少 `RETRIEVAL_TOP_K`；过滤免责声明等噪声块 |
+| 模型编造了参考资料里没有的数字 | 幻觉 | 1.1 对照参考内容 | 在提示词里加强“只能根据参考内容回答，没有就说不知道” |
+| 追问时答非所问 | 问题改写偏了 | 看回答上方的“按……检索”，或 1.1 命令里的 `retrieval_query` | 把问题问完整；必要时调小 `CHAT_HISTORY_TURNS` |
+| 回答里找不到明明在某份文档里的内容 | 会话限定了检索范围，没包含那份文档 | 输入框左下角的范围按钮 | 改成“检索全部文档”或勾上那份文档 |
+| 引用卡片的页码是 `-` | 文档是 Word、TXT 等没有页码的格式，或者是修复前入库的旧数据 | 1.4 看块里有没有 `page_num_int` | 旧数据执行 `python manage.py reindex-all` |
 
 ---
 
@@ -254,7 +277,7 @@ docker cp swxy_api:/tmp/vis /tmp/deepdoc_vis
 
 ```bash
 docker cp backend/scripts/. swxy_api:/tmp/scripts
-docker exec -w /app swxy_api python /tmp/scripts/eval_retrieval.py /tmp/scripts/eval_set.json --index 1
+docker exec -w /app swxy_api python /tmp/scripts/eval_retrieval.py /tmp/scripts/eval_set.json --user 1
 ```
 
 每题会调用一次向量模型和一次重排模型，20 题大约 30 秒。
@@ -263,15 +286,15 @@ docker exec -w /app swxy_api python /tmp/scripts/eval_retrieval.py /tmp/scripts/
 
 ```
 结果            粗筛名次    最终名次  问题
-命中               1       1  润本股份2025年上半年毛利率是多少   (候选 54 条)
+命中               2       1  润本股份2025年上半年毛利率是多少   (候选 60 条)
 ……（"直接问"的 13 题全部是第 1 名）……
-命中               7       1  润本股份卖货花的钱变多了吗   (候选 47 条)
-命中               3       4  婴童护肤品牌的赚钱能力怎么样   (候选 8 条)
-命中               5       5  小孩护肤的那家企业挣钱多不多   (候选 38 条)
-命中              11       3  国电电力的净资产收益率是多少   (候选 59 条)
-命中               2       1  太阳能发电增长快吗   (候选 53 条)
-命中               3       1  电厂卖电价格便宜了多少   (候选 45 条)
-命中               1       1  给股东发多少钱   (候选 22 条)
+命中               3       1  润本股份卖货花的钱变多了吗   (候选 59 条)
+命中               8       4  婴童护肤品牌的赚钱能力怎么样   (候选 59 条)
+命中               8       5  小孩护肤的那家企业挣钱多不多   (候选 59 条)
+命中              27       3  国电电力的净资产收益率是多少   (候选 60 条)
+命中               1       1  太阳能发电增长快吗   (候选 59 条)
+命中               3       1  电厂卖电价格便宜了多少   (候选 59 条)
+命中               1       1  给股东发多少钱   (候选 60 条)
 
 粗筛召回率（答案在 128 条候选里）: 20/20 = 100%
 前 1 命中率: 17/20 = 85%
@@ -285,8 +308,10 @@ MRR（答案平均排得多靠前，1 为满分）: 0.89
 **怎么读这个结果：**
 
 - **“直接问”全对，“换说法”明显变差。** 第 1 名命中率从 100% 掉到 57%，“小孩护肤的那家企业挣钱多不多”已经卡在第 5 名的边缘，再差一点就掉出去了。这就是关键词检索的短板：词对不上，分就低。
-- **粗筛名次和最终名次的对比，能看出重排的作用。** “国电电力的净资产收益率是多少”粗筛排第 11，重排后升到第 3。答案块里写的是“ROE”，问题里写的是“净资产收益率”，关键词对不上，是重排模型认出了它们是同一个意思。
-- **“婴童护肤品牌的赚钱能力怎么样”只有 8 条候选。** 库里共 60 块，关键词过滤挡掉了 52 块。这次答案碰巧在这 8 块里，换一个更偏的说法就可能直接找不到。
+- **粗筛名次和最终名次的对比，能看出重排的作用。** “国电电力的净资产收益率是多少”粗筛排第 27，重排后升到第 3。答案块里写的是“ROE”，问题里写的是“净资产收益率”，关键词对不上，是重排模型认出了它们是同一个意思。
+- **每题的候选数都接近库里的总块数（60）。** 这说明向量检索没有再被关键词条件挡住。修复前，“婴童护肤品牌的赚钱能力怎么样”只有 8 条候选，库里 60 块被挡掉了 52 块。
+
+> **修复前后最终指标一样，这正常。** 库里只有 60 块，修复前答案也碰巧在那 8 条候选里，重排都能把它排上来。修复的价值在库变大之后才会体现：几百份文档时，关键词过滤会把真正的答案挡在门外，向量检索救不回来。
 
 > **这个成绩偏乐观，别被 100% 骗了。** 现在库里只有 2 份文档、60 块，粗筛基本把整个库都留了下来，相当于开卷考试只有两页书。文档多到几百份时，128 条候选只占全库的一小部分，“换说法”的问题会最先出错。**测试集要随着知识库一起扩充。**
 
@@ -294,7 +319,7 @@ MRR（答案平均排得多靠前，1 为满分）: 0.89
 
 1. **问题要像真实用户问的。** 最好从真实的提问日志里挑（`messages` 表的 `user_question` 字段）。
 2. **一定要有“换说法”的题。** 只有“直接问”的测试集测不出向量检索的能力，分数会虚高。
-3. **`answer` 要选得唯一。** 选一个数字或者一个专有名词，确保它只出现在答案块里。比如“买入”这个词在研报的评级说明里也出现，不适合当 `answer`。
+3. `answer` **要选得唯一。** 选一个数字或者一个专有名词，确保它只出现在答案块里。比如“买入”这个词在研报的评级说明里也出现，不适合当 `answer`。
 4. **每份重要文档都要有题。** 20～50 题起步。
 5. **每次只改一个地方，改完就跑。** 比如只把 `vector_similarity_weight` 从 0.6 改成 0.8，跑一遍，和上次的结果对比。同时改好几处，就分不清是哪处起的作用。
 
@@ -313,38 +338,38 @@ MRR（答案平均排得多靠前，1 为满分）: 0.89
 
 和业内常见的 RAG 方案相比，这个系统还缺不少东西。下面按**建议的学习顺序**排列，每一项都写了要解决的问题和在哪里改。边改边用第 2 节的评测脚本验证效果，是最好的学习方式。
 
-### 3.1 第一阶段：先修已知问题
+### 3.1 第一阶段：修已知问题（已完成）
 
-这些都是现有代码的 bug，改动小，效果直接，适合作为熟悉代码的第一步。
+下面这些问题已经修复，可以对照代码走读里“以前的问题”看修复前后的差别：
 
-| 问题 | 改哪里 | 改完怎么验证 |
-|---|---|---|
-| 引用编号错位一位 | [`services/chat.py` 第 295 行](../backend/app/services/chat.py#L295)，`reference_id` 从 0 开始 | 页面上点引用角标，看是不是对应的那条 |
-| 页码没有入库 | [`services/parsing.py` 第 60 行](../backend/app/services/parsing.py#L60)，把 `page_num_int`、`position_int` 加进字典 | 重新上传后，引用卡片显示页码 |
-| 向量检索被关键词卡住 | [`es_conn.py` 第 243 行](../backend/app/engine/rag/utils/es_conn.py#L243)，`knn` 的 `filter` 只放结构化条件 | 评测脚本里“换说法”的候选数变多 |
-| ES 把中文拆成单字 | [`es_conn.py`](../backend/app/engine/rag/utils/es_conn.py#L44)，写入前用 `mapping.json` 建索引 | [代码走读附录 C](./RAG系统核心模块深入篇.md#c-自己动手跑一遍) 的分词检查命令输出完整的词 |
-
-第 2 项（页码）和第 4 项（建索引）改完，要**删掉旧索引、重新上传文档**才会生效；第 1、3 项改完重启后端即可。建议改一项、跑一次评测，看看各自贡献了多少。
+| 问题               | 修复位置                                                                                                      |
+| ---------------- | --------------------------------------------------------------------------------------------------------- |
+| 引用编号错位一位         | `services/chat.py` [的](../backend/app/services/chat.py#L26) `build_references()`                          |
+| 页码没有入库           | `services/ingestion.py` [的](../backend/app/services/ingestion.py#L82) `build_es_documents()`              |
+| 向量检索被关键词卡住       | `es_conn.py` [第 240 行](../backend/app/engine/rag/utils/es_conn.py#L240)                                   |
+| ES 把中文拆成单字       | `es_conn.py` [的](../backend/app/engine/rag/utils/es_conn.py#L56) `ensure_index()`                         |
+| 上传要等解析完、期间所有请求排队 | [`services/ingestion.py`](../backend/app/services/ingestion.py) + [`worker.py`](../backend/app/worker.py) |
 
 ### 3.2 第二阶段：补齐核心能力
 
-**问题改写（多轮对话）**
+**问题改写（多轮对话）——已完成**
+
+已实现，见 [代码走读 2.1](./RAG系统核心模块深入篇.md#21-接口收到问题)。下面是最初的设计思路：
 
 - **要解决：** 用户问“润本股份毛利率多少”，接着问“那净利率呢”。第二个问题单独拿去检索，根本不知道问的是哪家公司。
 - **做法：** 检索前，先把“历史对话 + 新问题”交给大模型，改写成一个完整的独立问题：“润本股份的净利率是多少”，再用改写后的问题去检索。历史对话在 `messages` 表里已经存了。
-- **在哪改：** [`api/chat.py` 的 `chat_on_docs()`](../backend/app/api/chat.py#L160)，在调用 `retrieve_content()` 之前。
+- **在哪改：** `api/chat.py` [的](../backend/app/api/chat.py#L109) `chat_on_docs()`，在调用 `retrieve_content()` 之前。历史对话用 [`list_messages()`](../backend/app/services/session.py#L54) 取。
 
 **过滤噪声块**
 
 - **要解决：** 研报末尾的免责声明占了约 1/4 的块，和任何问题都无关，却占着检索名额。
 - **做法：** 入库时用规则（如包含“本报告仅供参考”“版权归”的块）或者用一个小模型判断，过滤掉这些块。
-- **在哪改：** [`services/parsing.py` 的 `process_items()`](../backend/app/services/parsing.py#L33) 开头。
+- **在哪改：** `services/ingestion.py` [的](../backend/app/services/ingestion.py#L102) `ingest_document()`，在 `chunk()` 返回之后、向量化之前。
 
-**按文档范围检索**
+**按文档范围检索——手动选择已完成，自动识别待做**
 
-- **要解决：** 用户明确问“润本股份的……”时，检索时就应该只在润本的研报里找，彻底避免混进国电的内容。
-- **做法：** 从问题里识别出文档名或公司名，传给检索的 `doc_ids` 参数。`Dealer.retrieval()` 已经支持这个参数，只是没用上。
-- **在哪改：** [`services/retrieval.py`](../backend/app/services/retrieval.py#L13)。
+- **已实现：** 每个会话可以手动勾选只在哪几份文档里检索（输入框左下角），见 [代码走读 2.1](./RAG系统核心模块深入篇.md#21-接口收到问题)。
+- **可以继续做：** 用户没选范围、但问题里明确提到“润本股份的……”时，自动只在润本的研报里找。做法是从问题里识别出公司名或文档名，查出对应的文档 ID，传给 [`retrieve_content()`](../backend/app/services/retrieval.py#L13) 的 `doc_ids` 参数。要注意识别错了会漏掉答案，最好只在非常确定时才收窄范围。
 
 ### 3.3 第三阶段：提升质量
 
@@ -353,16 +378,16 @@ MRR（答案平均排得多靠前，1 为满分）: 0.89
 - **按结构切：** 按标题、章节切，而不是只按长度。同一个小节的内容放在一起。
 - **块之间重叠：** 相邻两块共享一两句话，避免答案正好被切在两块的交界处。
 - **大表格拆分：** 按每 N 行拆成多块，每块都带上表头，否则拆出来的行不知道每列是什么意思。
-- **在哪改：** [`engine/rag/nlp/__init__.py` 的 `naive_merge()`](../backend/app/engine/rag/nlp/__init__.py#L86) 和 [`tokenize_table()`](../backend/app/engine/rag/nlp/__init__.py#L208)。
+- **在哪改：** `engine/rag/nlp/__init__.py` [的](../backend/app/engine/rag/nlp/__init__.py#L86) `naive_merge()` 和 [`tokenize_table()`](../backend/app/engine/rag/nlp/__init__.py#L208)。
 
 **补词典**
 
 - 给 [`engine/rag/res/`](../backend/app/engine/rag/res/) 补上 `ner.json`（公司名、地名等实体）和 `synonym.json`（同义词，比如“ROE”和“净资产收益率”），关键词检索就能认识更多说法。
 
-**异步入库**
+**多个知识库**
 
-- **要解决：** 现在上传接口要等解析、向量化、写入全部完成才返回，大 PDF 要几分钟，容易超时。
-- **做法：** 上传后立即返回，把解析任务放进队列（Redis 已经有了）由后台处理，前端轮询进度。
+- **要解决：** 现在一个用户只有一个知识库，不能按项目或主题分开，也不能和别人共享。
+- **做法：** 新增“知识库”表，文档挂在知识库下。ES 里每块已经有 `kb_id` 字段，检索时传入用户有权访问的知识库 ID 列表即可，索引结构不用改。
 
 ### 3.4 进阶：了解业内常见的技巧
 

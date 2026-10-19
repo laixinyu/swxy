@@ -49,37 +49,63 @@
 
 ## 1.1 接口收到文件
 
-**做什么：** 把上传的文件存到磁盘，然后交给解析流程。
+**做什么：** 校验文件、保存到磁盘、写一条“排队中”的记录、放进任务队列，然后**立即返回**。解析不在这个请求里做。
 
-**代码：** [api/chat.py 第 216、295、298 行](../backend/app/api/chat.py#L216)
+**代码（精简）：** [api/chat.py 第 146 行](../backend/app/api/chat.py#L146)
 
 ```python
-# 前端不传 session_id，所以这里 session_id 就等于 user_id
-if session_id is None:
-    session_id = user_id
+@router.post("/upload_files")
+def upload_files(files: List[UploadFile] = File(...), user_id: str = Depends(current_user_id), db = Depends(get_db)):
+    for file in files:
+        file_name = storage.safe_filename(file.filename)                        # 去掉路径部分和控制字符
+        content = storage.read_upload(file, settings.max_upload_bytes)          # 超过 10MB 立即中止
+        doc = document_service.create_document(db, user_id, file_name, content)
+```
 
-# ……检查重名、校验文件、存到 engine/storage/file/{user_id}/ ……
+**代码（精简）：** [services/documents.py 第 54 行](../backend/app/services/documents.py#L54)
 
-execute_insert_process(file_url, file_name, session_id)   # 解析并写入 ES
-insert_knowledgebase(user_id, file_name)                  # 在 PostgreSQL 记一笔
+```python
+def create_document(db, user_id, file_name, content):
+    ext = storage.file_extension(file_name)
+    if ext not in settings.allowed_extension_set: raise HTTPException(400, ...)   # 扩展名白名单
+    storage.validate_content(ext, content)                                       # 文件头和扩展名必须对得上
+
+    doc_id = uuid.uuid4().hex
+    relative = storage.document_path(user_id, doc_id, ext)     # 磁盘路径只由 ID 决定：{用户}/{文档ID}.pdf
+    storage.save_file(relative, content)
+    db.add(Document(id=doc_id, user_id=user_id, kb_id=user_id, file_name=file_name,
+                    storage_path=relative, status=DocumentStatus.PENDING, ...))
+    db.commit()
+    enqueue_ingest(doc_id)                                     # 放进 Redis 队列，由 worker 处理
 ```
 
 **解释：**
 
-- `session_id` 在这里会被当作 ES 的**索引名**传下去。因为前端不传，它就是 `user_id`。所以**每个用户一个索引**，用户 1 的所有文档都在索引 `1` 里。
-- 真正干活的是 `execute_insert_process()`，下面几步都在它里面。
+- **接口用的是普通** `def`**，不是** `async def`**。** FastAPI 会把普通函数放进线程池执行；如果在 `async def` 里直接做读文件、查数据库这类同步操作，会卡住整个进程，所有用户都得排队。
+- **用户给的文件名只用于展示。** 磁盘上的文件名是文档 ID，所以文件名里写 `../../` 也写不到别的目录。
+- **同一用户不能有同名文件**，由数据库的唯一约束 `uq_documents_user_file` 保证。
+- `kb_id` 目前就是用户 ID。检索时按它过滤，不同用户的文档存在同一个 ES 索引里，但互相查不到。
 
-**代码：** [services/parsing.py 第 90 行](../backend/app/services/parsing.py#L90)
+真正的解析在 worker 进程里，入口是 [services/ingestion.py 第 102 行](../backend/app/services/ingestion.py#L102) 的 `ingest_document()`：
 
 ```python
-def execute_insert_process(file_path, file_name, index_name):
-    documents = parse(file_path)                                       # 1.2 ~ 1.5：解析、切块、分词
-    processed_documents = process_items(documents, file_name, index_name)  # 1.6：向量化、组装
-    for i in range(0, len(processed_documents), 100):                  # 每 100 条写一次 ES
-        es_connection.insert(documents=processed_documents[i:i+100], indexName=index_name)
+def ingest_document(doc_id):
+    _set_status(doc_id, DocumentStatus.PARSING)
+    binary = absolute_path(doc.storage_path).read_bytes()
+    items = chunk(doc.file_name, binary=binary, ...)            # 1.2 ~ 1.5：解析、切块、分词
+    embeddings = generate_embedding([...])                      # 1.6：向量化
+    es_docs = build_es_documents(doc, items, embeddings)        # 1.6：组装
+    es.delete_by_doc(index, doc.id)                             # 先清掉这个文档的旧切片，重复执行结果一样
+    es.insert(...); 
+    es.refresh(index)
+    _set_status(doc_id, DocumentStatus.DONE, chunk_count=len(es_docs))
 ```
 
-这几行就是整个上传流程。`parse()` 只是调了一下 `chunk()`，见下一步。
+出错时会清掉已经写入的切片，把状态改成 `failed` 并记下原因（知识库页上能看到），然后由任务队列自动重试，最多 2 次。如果是**重新解析**失败、而且旧切片还没被替换，就保留上次的结果：状态仍是“已完成”，旁边显示 ⚠，鼠标移上去能看到失败原因。
+
+**解析进度**由 [`ProgressReporter`](../backend/app/services/ingestion.py#L37) 写回数据库：解析器自己报告的进度映射到 5%～70%，生成向量是 72%，写入索引是 90%，完成是 100%。为了不每页都写一次库，最多每秒更新一次。前端知识库页每 3 秒刷新，显示“解析中 45%”，鼠标移上去能看到当前阶段（识别文字、分析版面、生成向量……）。
+
+**重新解析**：失败或已完成的文档可以在知识库页点“重新解析”（[`POST /documents/{id}/reparse`](../backend/app/api/history.py#L40)）。旧切片要等新的解析和向量化都成功后才会被替换，期间在“全部文档”范围下仍然能检索到；如果会话限定了检索范围，没解析完的文档会暂时排除。
 
 ---
 
@@ -125,7 +151,7 @@ def chunk(filename, binary=None, ..., callback=None, **kwargs):
 | TXT | 按标点切句 |
 | Markdown | 标题和下一行合在一起 |
 
-> **注意：** 这里的 `filename` 实际传进来的是**完整路径** `/app/engine/storage/file/1/润本股份.pdf`，所以 `title_tks` 实测是 `app engin storag file 1 润本股份`，混进了路径里的词。应该传 `os.path.basename(...)`。
+> **注意：** `filename` 要传纯文件名，不能带路径。`title_tks` 由它分词而来，检索时权重是正文的 5 倍。以前传的是完整存储路径，`title_tks` 变成了 `app engin storag file 1 润本股份`；现在 worker 传的是 `doc.file_name`，实测为 `润本股份`。
 
 ---
 
@@ -182,7 +208,7 @@ dfs(down, i + 1)    # 模型说该接，接上，继续往下找
 
 32 个特征（[第 108 行](../backend/app/engine/deepdoc/parser/pdf_parser.py#L108)）都是人能理解的规则，比如：上一行是不是以句号结尾、下一行是不是以“（一）”“1.”这种编号开头、两行的垂直距离是行高的几倍、是不是跨页了。XGBoost 模型根据这些特征给出“该不该接”的概率。
 
-**最后的 `_line_tag`** 给每段文字末尾加一个位置标签，形如 `@@3\t72.1\t523.4\t218.5\t230.0##`（页码、左、右、上、下），后面切块时会用它算出每块的页码。
+**最后的** `_line_tag` 给每段文字末尾加一个位置标签，形如 `@@3\t72.1\t523.4\t218.5\t230.0##`（页码、左、右、上、下），后面切块时会用它算出每块的页码。
 
 ---
 
@@ -190,7 +216,7 @@ dfs(down, i + 1)    # 模型说该接，接上，继续往下找
 
 **做什么：** 解析出来的段落有长有短，把它们合并成长度差不多的块。
 
-**代码（精简，省略了位置标签的处理）：** [engine/rag/nlp/\_\_init\_\_.py 第 86 行](../backend/app/engine/rag/nlp/__init__.py#L86)
+**代码（精简，省略了位置标签的处理）：** [engine/rag/nlp/init.py 第 86 行](../backend/app/engine/rag/nlp/__init__.py#L86)
 
 ```python
 def naive_merge(sections, chunk_token_num=128, delimiter="\n。；！？"):
@@ -217,7 +243,7 @@ def naive_merge(sections, chunk_token_num=128, delimiter="\n。；！？"):
 
 1. **128 不是上限。** 当前块 120 token 时再塞一段 300 token 的，这块就是 420 token。
 2. **段落不会被切断。** 一段话一定完整地在某一块里。
-3. **`delimiter` 参数没用到。** 函数签名里有，函数体里没用。
+3. `delimiter` **参数没用到。** 函数签名里有，函数体里没用。
 
 **实测：** 两份研报的块长度（单位 token）：
 
@@ -234,7 +260,7 @@ def naive_merge(sections, chunk_token_num=128, delimiter="\n。；！？"):
 
 **做什么：** 每块除了保存原文，还要保存分好词的版本，用于关键词检索。
 
-**代码：** [engine/rag/nlp/\_\_init\_\_.py 第 188 行](../backend/app/engine/rag/nlp/__init__.py#L188)
+**代码：** [engine/rag/nlp/init.py 第 188 行](../backend/app/engine/rag/nlp/__init__.py#L188)
 
 ```python
 def tokenize(d, t, eng):
@@ -262,7 +288,7 @@ content_ltks:         基本 数据 2025 年 08 月 19 日 盈利 预测 与 估
 
 分词器的工作原理见 [附录 A](#a-中文分词器是怎么分词的)。
 
-> **注意：** PDF 的块在这一步还会用 1.3 里的位置标签算出页码（`page_num_int`）和坐标（`position_int`），见 [`tokenize_chunks()` 第 280 行](../backend/app/engine/rag/nlp/__init__.py#L280)。但下一步写 ES 时没带上它们。
+> **注意：** PDF 的块在这一步还会用 1.3 里的位置标签算出页码（`page_num_int`）和坐标（`position_int`），见 `tokenize_chunks()` [第 280 行](../backend/app/engine/rag/nlp/__init__.py#L280)。下一步会把它们原样写进 ES，前端引用卡片上的页码就来自这里。
 
 ---
 
@@ -270,38 +296,61 @@ content_ltks:         基本 数据 2025 年 08 月 19 日 盈利 预测 与 估
 
 **做什么：** 给每块算向量，拼成 ES 能存的字典，批量写入。
 
-**代码：** [services/parsing.py 第 47 行](../backend/app/services/parsing.py#L47)
+**代码：** [services/ingestion.py 第 82 行](../backend/app/services/ingestion.py#L82)
 
 ```python
-texts = [item["content_with_weight"] for item in items]
-embeddings = batch_generate_embeddings(texts)          # 所有块一起向量化
+# 切块阶段算好、需要原样写入 ES 的字段
+CHUNK_FIELDS = (
+    "content_with_weight", "content_ltks", "content_sm_ltks",
+    "title_tks", "title_sm_tks", "page_num_int", "position_int", "top_int",
+)
 
-for item, embedding in zip(items, embeddings):
-    d = {
-        "id": xxhash.xxh64((item["content_with_weight"] + index_name).encode()).hexdigest(),
-        "content_ltks":        item["content_ltks"],
-        "content_with_weight": item["content_with_weight"],
-        "content_sm_ltks":     item["content_sm_ltks"],
-        "create_time": ..., "create_timestamp_flt": ...,
-    }
-    d["kb_id"]     = index_name                         # 就是 user_id
-    d["docnm_kwd"] = item["docnm_kwd"]                  # 文件路径
-    d["title_tks"] = item["title_tks"]
-    d["doc_id"]    = xxhash.xxh64(file_name.encode()).hexdigest()
-    d["docnm"]     = file_name
-    d[f"q_{len(embedding)}_vec"] = embedding            # 向量，字段名是 q_1024_vec
+def build_es_documents(doc, items, embeddings):
+    for i, (item, embedding) in enumerate(zip(items, embeddings)):
+        d = {field: item[field] for field in CHUNK_FIELDS if item.get(field) not in (None, "", [])}
+        d.update({
+            "id": xxhash.xxh64(f"{doc.id}:{i}:{item['content_with_weight']}".encode()).hexdigest(),
+            "doc_id": doc.id,                    # 删除、过滤都按它
+            "kb_id": doc.kb_id,                  # 检索时按它隔离用户
+            "docnm_kwd": doc.file_name,
+            "available_int": 1,
+            f"q_{len(embedding)}_vec": embedding,   # 向量，字段名是 q_1024_vec
+            ...
+        })
 ```
 
-向量化的代码在 [nlp/model.py 第 137 行](../backend/app/engine/rag/nlp/model.py#L137)：每 10 块一批调用阿里云百炼的 `qwen3.7-text-embedding`，任何一批失败，整个文件就上传失败。
+向量化在 [nlp/model.py 第 103 行](../backend/app/engine/rag/nlp/model.py#L103)：每 10 块一批调用阿里云百炼，单批失败会自动重试，间隔 1 秒、2 秒。
 
 **解释：**
 
-- 块的 ID 是“原文 + 索引名”的哈希，所以同一用户重复上传相同内容会覆盖，不会重复。
-- 向量字段名里带维度（`q_1024_vec`），检索时也按这个规则拼字段名。
+- 块 ID 由“文档 ID + 序号 + 原文”算出，同一个文档重新入库时 ID 不变；不同文档里内容相同的段落也不会互相覆盖。
+- 页码、坐标这些字段由切块阶段算好，这里**统一按字段清单带上**，不再一个个手写，所以不会漏。
 
-> **注意：字典是手动一个个字段写的，漏了几个。** 上一步算好的 `page_num_int`（页码）、`position_int`（坐标）、`image`（表格截图）、`title_sm_tks` 都没写进来。在运行中的索引里查过，60 块都没有页码字段，所以前端引用卡片的页码永远显示 `-`。修法：在这个字典里把这几个字段从 `item` 带上。
+**写入前先按** `mapping.json` **建索引。** [es_conn.py 第 56 行](../backend/app/engine/rag/utils/es_conn.py#L56)：
 
-**写入 ES 时还有一个问题。** [es_conn.py](../backend/app/engine/rag/utils/es_conn.py#L55) 在初始化时读了 `conf/mapping.json`（字段该怎么建索引的配置），但从来没用它建过索引。索引是第一次写入时 ES 自动建的，用的是默认规则。后果在 [2.4](#24-关键词和向量一起查-es) 讲。
+```python
+def ensure_index(self, indexName):
+    """按 conf/mapping.json 建索引。不能依赖写入时自动建索引，否则分词字段会被默认分析器拆成单字。"""
+    if not self.es.indices.exists(index=indexName):
+        self.es.indices.create(index=indexName, settings=self.mapping["settings"],
+                               mappings=self.mapping["mappings"])
+```
+
+`mapping.json` 规定了每类字段怎么存：`*_ltks`、`*_tks` 用按空格切的 `whitespace` 分析器，保留分词器分好的词；`*_kwd`、`*_id` 存成精确匹配的 `keyword`；`*_1024_vec` 存成向量。
+
+**实测：** 在运行中的索引上查到的映射
+
+| 字段 | 类型 |
+|---|---|
+| `content_ltks` | `text`，分析器 `whitespace` |
+| `title_tks` | `text`，分析器 `whitespace`，相似度 `scripted_sim` |
+| `kb_id`、`doc_id`、`docnm_kwd` | `keyword` |
+| `page_num_int`、`position_int` | `integer` |
+| `q_1024_vec` | `dense_vector`，余弦相似度 |
+
+60 个块全部带有页码，例如 `{'page_num_int': [2], 'position_int': [[2, 63, 282, 338, 475]]}`。
+
+> **以前的问题：** 原来的代码只加载了 `mapping.json`，从来没用它建索引，索引是第一次写入时 ES 按默认规则自动建的。结果 `content_ltks` 用了默认的 `standard` 分析器，`国电电力` 在 ES 里被拆成了 `国/电/电/力`。原来的组装代码也是手写字段，漏掉了页码和坐标。
 
 ---
 
@@ -309,32 +358,72 @@ for item, embedding in zip(items, embeddings):
 
 ## 2.1 接口收到问题
 
-**做什么：** 先检索，再把检索结果交给大模型，以流的形式返回。
+**做什么：** 检查会话归属，结合历史对话改写问题，在检索范围内检索，再把检索结果交给大模型，以流的形式返回。
 
-**代码：** [api/chat.py 第 160 行](../backend/app/api/chat.py#L160)
+**代码（精简）：** [api/chat.py 第 109 行](../backend/app/api/chat.py#L109)
 
 ```python
 @router.post("/chat_on_docs")
-async def chat_on_docs(session_id: str = Query(...), request: ChatRequest = Body(...), credentials = Security(access_security)):
-    user_id = str(credentials.subject.get("user_id"))
-    question = request.message
+def chat_on_docs(session_id: str = Query(...), request: ChatRequest = Body(...),
+                 user_id: str = Depends(current_user_id), db: Session = Depends(get_db)):
+    session = get_owned_session(db, session_id, user_id, create=True)   # 不是自己的会话 → 404
+    question = request.message.strip()                                   # 1～4000 个字符
 
-    try:
-        references = retrieve_content(user_id, question)    # 检索，得到 5 块
-    except Exception:
-        references = []                                     # 检索失败也不报错，当作没有参考内容
+    # 多轮对话：带上最近几轮历史，并把追问改写成可以单独检索的问题
+    history = history_messages(list_messages(db, session_id))
+    retrieval_query = rewrite_question(question, history)
 
-    return StreamingResponse(
-        get_chat_completion(session_id, question, references, user_id),   # 生成回答
-        media_type="text/event-stream",
-    )
+    # 检索范围：只用还存在、已解析完成的文档。一个都不剩时不检索，避免悄悄扩大到全部文档
+    scope = get_scope(session)
+    doc_ids = None
+    if scope:
+        doc_ids = [doc.id for doc in document_service.owned_documents(db, user_id, scope)
+                   if doc.status == DocumentStatus.DONE]
+
+    references = []
+    if doc_ids is None or doc_ids:
+        references = retrieve_content(user_id, retrieval_query, doc_ids)    # 用改写后的问题检索
+
+    return StreamingResponse(stream_chat(session_id, question, references, need_name,
+                                         history=history, retrieval_query=retrieval_query),
+                             media_type="text/event-stream")
 ```
 
 **解释：**
 
-- 用 `user_id` 检索，也就是去索引 `1` 里找。
-- 检索失败**不会报错**，只是参考内容为空。这时提示词里的参考内容一栏会写成“暂无相关参考内容”，大模型通常会回答资料里没有相关信息。
-- `get_chat_completion()` 是一个生成器，每 `yield` 一次，`StreamingResponse` 就往浏览器推一条消息。
+- **会话归属校验**在 [services/session.py 第 26 行](../backend/app/services/session.py#L26)。所有按会话访问的接口（问答、历史消息、检索范围、临时文档）都先过这一关，不是自己的会话一律返回 404，连“这个会话存在”都不透露。
+- **问题改写**在 [services/conversation.py 第 44 行](../backend/app/services/conversation.py#L44)，下面单独讲。
+- **检索范围**存在会话上（`sessions.doc_ids`），由 [`PUT /sessions/{id}/scope`](../backend/app/api/chat.py#L59) 设置。设置时会校验每个文档 ID 都属于当前用户，别人的文档 ID 放不进来。
+- 检索失败**不会中断回答**，只是参考内容为空，但会在日志里留下完整的报错。
+
+### 追问为什么要先改写
+
+用户先问“青松科技上半年营业收入是多少”，接着问“那它的净利率呢？”。第二个问题如果直接拿去检索，里面根本没有“青松科技”，关键词和向量都对不上。
+
+[`rewrite_question()`](../backend/app/services/conversation.py#L44) 把最近几轮对话和新问题一起交给大模型，要求它补全代词和省略的部分，返回一个能单独理解的问题：
+
+```python
+REWRITE_PROMPT = """你负责把用户在多轮对话中的最新问题，改写成一个不依赖上下文、可以单独拿去检索资料的问题。
+1. 把代词和省略的内容补全，例如“它”“那家公司”“净利率呢”要补成具体的对象和指标。
+2. 保留原问题的意图、时间范围和专有名词，不要回答问题，也不要添加对话里没有的信息。
+3. 如果最新问题本身已经完整，原样返回。
+……"""
+```
+
+**实测：**
+
+| 用户原问题 | 改写后（实际检索用的） |
+|---|---|
+| 那它的净利率呢？（上一轮问的是青松科技） | 青松科技2025年上半年的净利率是多少？ |
+| 那净利率呢？（上一轮问的是润本股份毛利率） | 润本股份上半年净利率是多少？ |
+| 国电电力的装机容量有多大？ | 国电电力的装机容量有多大？（本身完整，原样返回） |
+
+几个设计要点：
+
+- **第一轮不改写**，没有历史就直接用原问题，不多花一次调用。
+- **改写失败就用原问题**，不影响回答，只写一条告警日志。
+- **改写后的问题会推给前端**，显示在回答上方（“按……检索”），也保存在 `messages.retrieval_query`，方便排查“为什么检索到了这些”。
+- **代价**：每次追问多一次大模型调用，实测 2～6 秒。可以设 `REWRITE_MODEL` 换一个更快的小模型专门做改写。
 
 ---
 
@@ -342,42 +431,49 @@ async def chat_on_docs(session_id: str = Query(...), request: ChatRequest = Body
 
 **做什么：** 调检索核心 `Dealer.retrieval()`，只保留前端需要的字段。
 
-**代码（精简）：** [services/retrieval.py 第 13 行](../backend/app/services/retrieval.py#L13)
+**代码：** [services/retrieval.py 第 13 行](../backend/app/services/retrieval.py#L13)
 
 ```python
-def retrieve_content(indexNames, question):
+def retrieve_content(kb_id, question, doc_ids=None):
     results = dealer.retrieval(
         question=question,
-        tenant_ids=indexNames,            # 索引名 = user_id
-        vector_similarity_weight=0.6,     # 重排阶段：重排模型分占 60%，关键词分占 40%
-        page=1, page_size=5,              # 只要前 5 条
-        ...)
-    return [{"id": i, "document_id": c["doc_id"], "document_name": c["docnm_kwd"].split("/")[-1],
-             "content_with_weight": c["content_with_weight"]}
-            for i, c in enumerate(results["chunks"], start=1)]
+        tenant_ids=settings.es_index,                               # 所有用户共用一个索引 swxy_chunks
+        kb_ids=[kb_id],                                             # 只查当前用户的块
+        doc_ids=doc_ids or None,                                    # 限定检索范围：只查这些文档
+        page=1, page_size=settings.retrieval_top_k,                 # 只要前 5 条
+        similarity_threshold=settings.similarity_threshold,         # 低于 0.1 的丢掉
+        vector_similarity_weight=settings.vector_similarity_weight, # 重排阶段：重排模型分占 60%
+    )
+    return [{"document_id": c["doc_id"], "document_name": c["docnm_kwd"],
+             "content_with_weight": c["content_with_weight"], "positions": c["positions"]}
+            for c in results["chunks"]]
 ```
 
-**`Dealer.retrieval()` 内部分三步：**
+`Dealer.retrieval()` **内部分三步：**
 
-**代码（精简）：** [nlp/search_v2.py 第 297 行](../backend/app/engine/rag/nlp/search_v2.py#L297)
+**代码（精简）：** [nlp/search_v2.py 第 310 行](../backend/app/engine/rag/nlp/search_v2.py#L310)
 
 ```python
 def retrieval(self, question, ..., page_size, similarity_threshold=0.1, vector_similarity_weight=0.3, ...):
-    req = {"question": question, "size": max(page_size * 3, 128), "similarity": similarity_threshold, ...}
+    req = {"question": question, "kb_ids": kb_ids, "size": max(page_size * 3, settings.retrieval_candidates), ...}
 
-    sres = self.search(req, [index_name(tid) for tid in tenant_ids], ...)        # 第一步：查 ES，取 128 条候选
+    sres = self.search(req, [index_name(tid) for tid in tenant_ids], kb_ids, ...)  # 第一步：查 ES，取 128 条候选
 
-    sim, tsim, vsim = self.rerank_by_model(sres, question,                        # 第二步：重排打分
+    sim, tsim, vsim = self.rerank_by_model(sres, question,                          # 第二步：重排打分
                                            1 - vector_similarity_weight, vector_similarity_weight)
-    idx = np.argsort(sim * -1)[0:page_size]                                       # 按分数从高到低排
+    idx = np.argsort(sim * -1)[0:page_size]                                         # 按分数从高到低排
 
-    for i in idx:                                                                 # 第三步：取前 5，低于 0.1 的丢掉
+    for i in idx:                                                                   # 第三步：取前 5，低于阈值的丢掉
         if sim[i] < similarity_threshold:
             break
         ranks["chunks"].append({..., "similarity": sim[i], "term_similarity": tsim[i], "vector_similarity": vsim[i]})
 ```
 
 **解释：** 先粗筛（ES 返回 128 条），再精排（重排模型逐条打分），最后取前 5。下面 2.3、2.4 讲粗筛，2.5 讲精排。
+
+`kb_ids` 和 `doc_ids` 都会变成 ES 的 `terms` 过滤条件，同时作用在关键词检索和向量检索上（2.4 里的 `knn_filter`）。所以限定范围后，范围外的文档在两路检索里都不会出现。
+
+所有参数都在 [core/config.py](../backend/app/core/config.py#L79)，改 `.env` 就能调，见 [附录 B](#b-想调效果改哪里)。
 
 ---
 
@@ -440,7 +536,7 @@ self.query_fields = [
 ]
 ```
 
-**问题里的词出现在文件名里，得分是出现在正文里的 5 倍。** 另外 `important_*`、`question_*`、`title_sm_tks` 这几个字段本系统从没写入过，查了也是空。
+**问题里的词出现在文件名里，得分是出现在正文里的 5 倍。** 另外 `important_`*、`question_*`、`title_sm_tks` 这几个字段本系统从没写入过，查了也是空。
 
 > **注意：** 上面“国电电力”的权重只排第三，比“2023”“营业”都低，这不太合理。原因是权重计算依赖的两个词典 `ner.json`（实体词典，会给公司名 ×3）和 `term.freq`（文档频率）不在 `engine/rag/res/` 里。权重公式见 [term_weight.py 第 223 行](../backend/app/engine/rag/nlp/term_weight.py#L223)。
 
@@ -450,7 +546,7 @@ self.query_fields = [
 
 **做什么：** 把问题也转成向量，和 2.3 的关键词语句一起发给 ES，取 128 条候选。
 
-**代码：** [nlp/search_v2.py 第 100 行](../backend/app/engine/rag/nlp/search_v2.py#L100)
+**代码：** [nlp/search_v2.py 第 113 行](../backend/app/engine/rag/nlp/search_v2.py#L113)
 
 ```python
 matchText, keywords = self.qryr.question(qst, min_match=0.3)          # 2.3 的关键词语句，至少匹配 30%
@@ -464,9 +560,14 @@ if total == 0:                                                        # 一条�
 
 `dataStore.search()` 把这三样翻译成 ES 查询：
 
-**代码：** [utils/es_conn.py 第 224 行](../backend/app/engine/rag/utils/es_conn.py#L224)
+**代码（精简）：** [utils/es_conn.py 第 240 行](../backend/app/engine/rag/utils/es_conn.py#L240)
 
 ```python
+# kb_id、available_int 等结构化条件已经放进了 bqry.filter
+# kNN 只能带结构化过滤。如果把下面的 query_string 也放进去，
+# 只有关键词先命中的块才有资格参加向量检索，换了说法的问题就找不回来。
+knn_filter = Q("bool", filter=list(bqry.filter)).to_dict() if bqry.filter else None
+
 for m in matchExprs:
     if isinstance(m, MatchTextExpr):                        # 关键词部分
         bqry.must.append(Q("query_string", fields=m.fields, query=m.matching_text, ...))
@@ -474,42 +575,33 @@ for m in matchExprs:
 
     elif isinstance(m, MatchDenseExpr):                     # 向量部分
         s = s.knn(m.vector_column_name, m.topn, m.topn * 2,
-                  query_vector=list(m.embedding_data),
-                  filter=bqry.to_dict(),                    # ← 注意这里
-                  similarity=similarity)
+                  query_vector=list(m.embedding_data), similarity=similarity,
+                  filter=knn_filter)                        # 只带结构化过滤
 ```
 
-**实测：** 问“润本股份的毛利率是多少”时，发给 ES 的请求（截取主干）：
+发给 ES 的请求结构是这样的（截取主干）：
 
 ```json
 {
   "query": { "bool": {
-      "must": [{ "query_string": { "query": "(毛利率 OR \"利率\" …)^0.65 (润本股份 OR \"股份\" …)^0.35 …",
-                                   "minimum_should_match": "30%" } }],
+      "must":   [{ "query_string": { "query": "(毛利率 OR \"利率\" …)^0.65 (润本股份 OR \"股份\" …)^0.35 …",
+                                     "minimum_should_match": "30%" } }],
+      "filter": [{ "terms": { "kb_id": ["1"] } }, …],
       "boost": 0.05 } },
   "knn": {
       "field": "q_1024_vec", "k": 1024, "num_candidates": 2048,
       "query_vector": [0.0236, -0.0271, 0.0423, …],
-      "filter": { "bool": { "must": [{ "query_string": "……和上面一模一样……" }] } },
+      "filter": { "bool": { "filter": [{ "terms": { "kb_id": ["1"] } }, …] } },
       "similarity": 0.1 },
   "size": 128
 }
 ```
 
-**解释：** ES 会分别算关键词分和向量分，然后**相加**。关键词分乘了 0.05，所以这一步的排序**基本由向量决定**。
+**解释：** 关键词查询和向量查询**各自独立地**找块，ES 把两边的结果合并，分数相加。关键词分乘了 0.05，所以这一步的排序**基本由向量决定**。两边都只在 `kb_id` 属于当前用户的块里找。
 
-> **问题一：向量检索被关键词“卡住”了。** 看代码里标“注意这里”的那行：`filter=bqry.to_dict()` 把关键词查询也塞进了向量检索的过滤条件。结果是**只有关键词至少匹配 30% 的块，才有资格参加向量检索**。用户换了个说法（问“赚钱能力”，原文写“毛利率”），关键词对不上，向量检索本该靠语义找回来，但这些块已经被过滤掉了。修法：`filter` 里只放 `kb_id` 这类结构化条件，不放 `query_string`。
-
-> **问题二：ES 把中文拆成了单字。** 1.6 提到索引是 ES 自动建的。实测 `content_ltks` 字段用的是 ES 默认的 `standard` 分析器，它不认识中文词，会把每个汉字拆开：
+> **以前的问题：向量检索被关键词“卡住”。** 原来的代码是 `filter=bqry.to_dict()`，把关键词查询也塞进了向量检索的过滤条件，只有关键词至少匹配 30% 的块才有资格参加向量检索。
 >
-> ```
-> 代码分好的词： 国电电力 营业 收入 增长
-> ES 实际存的：  国 电 电 力 营 业 收 入 增 长
-> ```
->
-> 所以 2.3 精心构造的“国电电力”，到了 ES 里变成了 4 个单字分别匹配，精度明显下降。`mapping.json` 里本来设计的是 `whitespace` 分析器（按空格切，保留代码分好的词）。修法：写入前用 `mapping.json` 建索引；改完要删掉旧索引、重新上传文档。
->
-> 向量字段 `q_1024_vec` 被 ES 正确识别成了向量类型，这部分没问题。
+> **实测对比：** 问“婴童护肤品牌的赚钱能力怎么样”，原文里写的是“毛利率”“净利率”，关键词几乎对不上。修复前只有 **8 条**候选进入重排，修复后是 **59 条**（库里一共 60 块）。
 
 ---
 
@@ -517,7 +609,7 @@ for m in matchExprs:
 
 **做什么：** 对 128 条候选，用“关键词匹配度 + 重排模型分”重新打分。
 
-**代码（精简，省略了 `important_kwd` 和排序特征）：** [nlp/search_v2.py 第 268 行](../backend/app/engine/rag/nlp/search_v2.py#L268)
+**代码（精简，省略了** `important_kwd` **和排序特征）：** [nlp/search_v2.py 第 281 行](../backend/app/engine/rag/nlp/search_v2.py#L281)
 
 ```python
 def rerank_by_model(self, sres, query, tkweight=0.3, vtweight=0.7, ...):
@@ -539,7 +631,7 @@ def rerank_by_model(self, sres, query, tkweight=0.3, vtweight=0.7, ...):
 最终分 = 0.4 × 关键词匹配度 + 0.6 × 重排模型分
 ```
 
-重排模型的调用在 [nlp/model.py 第 43 行](../backend/app/engine/rag/nlp/model.py#L43)：把问题和所有候选一起发给阿里云百炼的 `qwen3.7-text-rerank`，模型对每一对“问题—候选”给出 0～1 的相关度。
+重排模型的调用在 [nlp/model.py 第 55 行](../backend/app/engine/rag/nlp/model.py#L55)：把问题和所有候选一起发给阿里云百炼的 `qwen3.7-text-rerank`，模型对每一对“问题—候选”给出 0～1 的相关度。
 
 **解释：**
 
@@ -571,100 +663,114 @@ def rerank_by_model(self, sres, query, tkweight=0.3, vtweight=0.7, ...):
 
 重排失败时，关键词“毛利率”在国电的研报里也有，所以国电的内容排到了第 2、3 名，大模型很可能拿国电的数据回答润本的问题。
 
-> **注意：重排失败时不报错。** 看 [model.py 第 80 行](../backend/app/engine/rag/nlp/model.py#L80)：失败时只打印一行日志，返回全 0 的分数，系统照常运行。如果回答里混进了别的公司的数据，先搜后端日志里的 `重排失败`。
+> **注意：重排失败时不会中断回答。** 看 [model.py 第 92 行](../backend/app/engine/rag/nlp/model.py#L92)：重排接口失败会先自动重试一次，还失败就返回全 0 的分数，同时写一条告警日志，排序退化成只看关键词分。如果回答里混进了别的公司的数据，先查日志：`docker compose logs swxy_api | grep 重排失败`。
 
 ---
 
 ## 2.6 拼提示词
 
-**做什么：** 把检索到的 5 块、会话临时文档、用户问题拼成一段提示词。
+**做什么：** 把检索到的 5 块、会话临时文档、用户问题拼成发给大模型的消息。
 
-**代码（精简）：** [services/chat.py 第 295 行](../backend/app/services/chat.py#L295)
+**代码：** [services/chat.py 第 26 行](../backend/app/services/chat.py#L26)
 
 ```python
-reference_parts = []
-reference_id = 1
+def build_references(session_id, retrieved):
+    """提示词里的编号和返回给前端的 documents 必须一一对应，前端按下标取引用。"""
+    references = list(retrieved)
+    quick_content = quick_parse.get_content(session_id)        # 会话里临时上传的小文档（Redis）
+    if quick_content:
+        references.append({"document_name": "当前会话文档", "content_with_weight": quick_content[:4000], ...})
+    return references
 
-# 知识库检索到的块，从 [1] 开始编号
-if retrieved_content:
-    refs = []
-    for ref in retrieved_content:
-        refs.append(f"[{reference_id}] {ref['content_with_weight']}")
-        reference_id += 1
-    reference_parts.append("**知识库内容：**\n" + "\n".join(refs))
-
-# 会话里临时上传的小文档（从 Redis 读），截到 4000 字，作为一条
-if quick_parse_content:
-    reference_parts.append(f"**当前会话文档内容：**\n[{reference_id}] {quick_parse_content[:4000]}")
+def format_references(references):
+    return "\n\n".join(f"[{i}] 《{ref['document_name']}》\n{ref['content_with_weight']}"
+                       for i, ref in enumerate(references))  # 从 [0] 开始编号
 ```
 
-[第 325 行](../backend/app/services/chat.py#L325) 把它们拼进模板：
+规则放在系统消息里，[第 17 行](../backend/app/services/chat.py#L17)：
 
 ```python
-prompt = f"""
-你是一个专业的智能助手，擅长基于提供的参考资料回答用户问题。请遵循以下原则：
+SYSTEM_PROMPT = """你是一个专业的智能助手，擅长基于提供的参考资料回答用户问题。请遵循以下原则：
+1. 优先基于参考内容回答，确保答案准确可靠。
+2. 参考内容按 [0]、[1]、[2] …… 编号。回答中用到参考内容的地方，要在该句末尾标注来源，
+   格式为 ##编号$$，例如 ##0$$ 表示来自第 [0] 条参考内容。
+……"""
 
-**回答要求：**
-1. 优先基于参考内容回答，确保答案准确可靠
-2. 在回答中，每一块内容都必须标注引用的来源，格式为：##引用编号$$。例如：##1$$ 表示引用自第1条参考内容。
-……
-**参考内容：**
-{formatted_references}
-
-**用户问题：**
-{question}
-"""
+messages = [
+    {"role": "system", "content": SYSTEM_PROMPT},
+    {"role": "user", "content": f"参考内容：\n{format_references(references)}\n\n用户问题：\n{question}"},
+]
 ```
 
 **解释：**
 
-- 大模型被要求在回答里写 `##1$$` 这样的标记，表示“这句话来自第 1 条参考”。前端会把它变成可点的角标（2.9）。
+- **提示词的编号和返回给前端的参考列表是同一个列表**，`##0$$` 就是列表里的第 0 项。会话临时文档在两边都算一条，编号不会错开（2.9 讲前端怎么用这个编号）。
+- **规则放系统消息，资料和问题放用户消息。** 这是对话模型的标准用法，模型对系统消息里的约束遵守得更好。
 - **会话临时文档不参与检索**，整篇（截到 4000 字）直接塞进提示词。所以它适合“帮我总结这份材料”；知识库适合“在一堆资料里找答案”。
 
-> **注意：只支持单轮问答。** 整个提示词只有这一轮的问题，没有历史对话。用户追问“那它的净利率呢”，模型不知道“它”是谁。
+**多轮对话：历史也要交给模型。** 改写只解决了“检索什么”，回答时模型还要知道前面聊了什么。[`history_messages()`](../backend/app/services/conversation.py#L27) 取最近 5 轮问答，按 user / assistant 交替放在系统消息和本轮问题之间：
+
+```python
+messages = [
+    {"role": "system", "content": SYSTEM_PROMPT},
+    *history,                                   # 最近 5 轮：user 问题、assistant 回答……
+    {"role": "user", "content": f"参考内容：\n……\n\n用户问题：\n{question}"},
+]
+```
+
+- **历史回答里的引用标记会被去掉。** 旧回答里的 `##0$$` 指向的是那一轮的参考列表，留着的话模型会把它和本轮的 `[0]` 混淆。
+- **每条历史回答最多保留 1500 字**，避免几轮之后提示词过长。
+- 轮数和长度都可以在 `.env` 里调：`CHAT_HISTORY_TURNS`、`CHAT_HISTORY_ANSWER_CHARS`。
 
 ---
 
 ## 2.7 调大模型并流式返回
 
-**做什么：** 调用大模型，每收到一小段就推给前端；结束后生成推荐问题、写数据库。
+**做什么：** 调用大模型，每收到一小段就推给前端；回答完成后保存对话，再告诉前端结束。
 
-**代码（精简）：** [services/chat.py 第 354 行](../backend/app/services/chat.py#L354)
+**代码（精简）：** [services/chat.py 第 95 行](../backend/app/services/chat.py#L95)
 
 ```python
-completion = client.chat.completions.create(model="gpt-6.1-sol", messages=[{"role": "user", "content": prompt}], stream=True)
+def stream_chat(session_id, question, retrieved, need_name):
+    references = build_references(session_id, retrieved)
+    recommended_future = _executor.submit(generate_recommended_questions, question, ...)  # 和回答同时开始生成
 
-# 第一条消息：把参考内容发给前端（用于显示来源和引用）
-yield f"event: message\ndata: {json.dumps({'documents': all_documents})}\n\n"
+    try:
+        yield _sse("message", {"documents": references})           # 第一条：参考内容
+        stream = get_llm_client().chat.completions.create(model=settings.chat_model, messages=messages, stream=True)
+        for chunk in stream:
+            content = chunk.choices[0].delta.content or ""
+            answer.append(content)
+            yield _sse("message", {"role": "assistant", "content": content, "thinking": False})
+    except Exception:
+        logger.exception(...)
+        yield _sse("error", {"error": "生成回答失败，请稍后重试"})   # 不把内部报错发给前端
+        return
 
-for chunk in completion:
-    if chunk.choices[0].finish_reason == "stop":                       # 回答结束
-        recommended_questions = generate_recommended_questions(question, ...)
-        yield f"event: message\ndata: {json.dumps({'recommended_questions': recommended_questions})}\n\n"
-        yield "event: end\ndata: [DONE]\n\n"
-        write_chat_to_db(session_id, question, model_answer, all_documents, ...)   # 存 messages 表
-        update_session_name(session_id, question, user_id)                         # 首轮：让大模型给会话起名
-        break
-    else:                                                               # 回答进行中
-        content = chunk.choices[0].delta.content or ""
-        model_answer += content
-        yield f"event: message\ndata: {json.dumps({'role': 'assistant', 'content': content, 'thinking': False})}\n\n"
+    recommended = recommended_future.result(timeout=15)            # 这时通常已经生成好了
+    yield _sse("message", {"recommended_questions": recommended})
+    save_message(db, session_id, question, "".join(answer), references, recommended, ...)   # 先存库
+    if need_name:
+        _executor.submit(_name_session, session_id, question)      # 会话起名放到后台，不耽误结束
+    yield "event: end\ndata: [DONE]\n\n"                          # 再结束
 ```
 
 **解释：** 前端按顺序会收到这些消息：
 
 ```
-event: message   data: {"documents": [...5 块 + 临时文档...]}        ← 先发参考内容
+event: message   data: {"retrieval_query": "青松科技2025年上半年的净利率是多少？"}   ← 追问时才有：改写后的问题
+event: message   data: {"documents": [...5 块 + 临时文档...]}        ← 参考内容
 event: message   data: {"role":"assistant","content":"润本","thinking":false}
 event: message   data: {"role":"assistant","content":"股份","thinking":false}
-……（一个字一个字）……
+……（一段一段）……
 event: message   data: {"recommended_questions": ["…", "…", "…"]}    ← 再发 3 个推荐问题
 event: end       data: [DONE]                                        ← 结束
 ```
 
+- **推荐问题和回答同时生成。** 只依赖问题和文档名，没必要等回答写完再开始，回答结束时它通常已经好了。
+- **先存库，再发** `[DONE]`**。** 前端收到结束信号时，这轮对话一定已经保存了。
+- **大模型客户端全进程复用**（[`get_llm_client()`](../backend/app/services/llm.py#L15)），不用每次请求都重新建连接。
 - 如果模型返回了思考过程（`reasoning_content`），会以 `thinking: true` 发出，前端单独显示。
-- **推荐问题要等一次额外的大模型调用**，所以回答完后还要等一两秒才结束。
-- **会话名是在第一轮问答结束后才写库的**。只打开没提问的会话，不会出现在历史列表里。
 
 ---
 
@@ -672,7 +778,7 @@ event: end       data: [DONE]                                        ← 结束
 
 **做什么：** 一行一行读后端推来的数据，拼成完整的回答。
 
-**代码（伪代码，“按 document_id 去重”那一行是对原代码的概括）：** [frontend/src/pages/chat/index.tsx 第 194 行](../frontend/src/pages/chat/index.tsx#L194)
+**代码（伪代码，“按 document_id 去重”那一行是对原代码的概括）：** [frontend/src/pages/chat/index.tsx 第 198 行](../frontend/src/pages/chat/index.tsx#L198)
 
 ```tsx
 function parseData(slice: string) {
@@ -680,6 +786,11 @@ function parseData(slice: string) {
   if (str === '[DONE]') return
 
   const json = JSON.parse(str)
+
+  if (json?.error) {                                     // 出错：用错误样式显示
+    target.error = json.error
+    return
+  }
 
   if (json?.content) {                                   // 回答片段：拼起来
     if (json.thinking) target.think = (target.think || '') + json.content
@@ -699,16 +810,15 @@ function parseData(slice: string) {
 
 **解释：**
 
-- 前端只看以 `data: ` 开头的行，**不看 `event:` 行**。
+- 前端只看以 `data:`  开头的行，**不看** `event:` **行**。
 - `target` 是用 valtio 包装的响应式对象，直接改它的属性，界面就会自动刷新。
-
-> **注意：** 因为不看 `event:`，后端出错时发的 `event: error` 消息（内容是 `{"role":"error","content":"错误信息"}`）也有 `content` 字段，会被**当成回答正文拼进去**显示。
+- 出错时后端发 `{"error": "…"}`，前端识别 `error` 字段，用错误样式显示，不会混进回答正文。
 
 ---
 
 ## 2.9 前端渲染引用角标
 
-**做什么：** 把回答里的 `##1$$` 变成可以点击的引用角标，点击后显示对应的原文。
+**做什么：** 把回答里的 `##0$$` 变成可以点击的引用角标，点击后显示对应的原文。
 
 **代码（精简）：** [frontend/src/pages/chat/component/result.tsx 第 43 行](../frontend/src/pages/chat/component/result.tsx#L43)
 
@@ -726,7 +836,7 @@ function parseData(slice: string) {
 }
 ```
 
-点击时 [chat-message.tsx 第 106 行](../frontend/src/pages/chat/component/chat-message.tsx#L106)：
+点击时 [chat-message.tsx 第 114 行](../frontend/src/pages/chat/component/chat-message.tsx#L114)：
 
 ```tsx
 onRefrence={(index) => {
@@ -735,17 +845,17 @@ onRefrence={(index) => {
 }}
 ```
 
-> **问题：编号错位一位。** 把三处代码放在一起看：
->
-> | 位置 | 第一条参考 |
-> |---|---|
-> | 提示词（2.6） | 编号 `[1]`，模型写 `##1$$` |
-> | 角标显示（本节） | `1 + 1` → 显示 `[2]` |
-> | 点击取值（本节） | `reference[1]` → 取到的是**第二条** |
->
-> 用户看到的是 `[2]`，点开的是第二条，但模型说的是第一条。修法：提示词改成从 `[0]` 开始编号（RAGFlow 原版就是这样），前端不用动。
->
-> 另外，会话临时文档在提示词里算一条，在 `documents` 里却按 2000 字拆成了多条，也会让它后面的编号对不上。
+**解释：** 把三处放在一起看，第一条参考内容的编号是这样对应的：
+
+| 位置 | 第一条参考 |
+|---|---|
+| 提示词（2.6） | 编号 `[0]`，模型写 `##0$$` |
+| 角标显示（本节） | `0 + 1` → 显示 `[1]` |
+| 点击取值（本节） | `reference[0]` → 第一条 |
+
+三处对得上：用户看到 `[1]`，点开的就是模型引用的那一条。
+
+> **以前的问题：编号错位一位。** 原来提示词从 `[1]` 开始编号，前端却按 0 开始取，用户看到 `[2]`、点开的是第二条。会话临时文档在提示词里算一条，返回给前端时却拆成了多条，也会让后面的编号错开。现在两边用的是同一个列表。冒烟测试里专门检查了“第一个引用指向的块确实包含答案”。
 
 ---
 
@@ -762,7 +872,7 @@ onRefrence={(index) => {
 低速 176 d
 ```
 
-**算法（伪代码）：** [`tokenize()` 第 266 行](../backend/app/engine/rag/nlp/rag_tokenizer.py#L266)
+**算法（伪代码）：** `tokenize()` [第 266 行](../backend/app/engine/rag/nlp/rag_tokenizer.py#L266)
 
 ```python
 def tokenize(self, line):
@@ -776,7 +886,7 @@ def tokenize(self, line):
         # 不一样的部分：用 dfs_ 枚举所有切法，取得分最高的
 ```
 
-不一样的部分怎么打分？[`score_()` 第 179 行](../backend/app/engine/rag/nlp/rag_tokenizer.py#L179)：
+不一样的部分怎么打分？`score_()` [第 179 行](../backend/app/engine/rag/nlp/rag_tokenizer.py#L179)：
 
 ```python
 def score_(self, tfts):
@@ -799,24 +909,39 @@ def score_(self, tfts):
 
 英文会做词干提取（`Apple` → `appl`），这样 `iPhone` 和 `iPhones` 能匹配上。
 
-**细粒度分词** [`fine_grained_tokenize()` 第 339 行](../backend/app/engine/rag/nlp/rag_tokenizer.py#L339)：对 3～10 个字的词再拆一次，取得分第二高的切法。`国电电力` → `国电 电力`，`毛利率` → `毛 利率`。
+**细粒度分词** `fine_grained_tokenize()` [第 339 行](../backend/app/engine/rag/nlp/rag_tokenizer.py#L339)：对 3～10 个字的词再拆一次，取得分第二高的切法。`国电电力` → `国电 电力`，`毛利率` → `毛 利率`。
 
 ---
 
 ## B. 想调效果，改哪里
 
+下面的参数都在 [core/config.py](../backend/app/core/config.py#L79) 里定义，在 `backend/.env` 里设置对应的环境变量（名字不区分大小写），重启后端即可，不用改代码。
+
+| 想要 | 环境变量 | 默认值 |
+|---|---|---|
+| 块更大或更小 | `CHUNK_TOKEN_NUM` | 128 |
+| 给模型更多或更少参考 | `RETRIEVAL_TOP_K` | 5 |
+| 重排的候选池大小 | `RETRIEVAL_CANDIDATES` | 128 |
+| 更看重语义或关键词 | `VECTOR_SIMILARITY_WEIGHT` | 0.6 |
+| 过滤掉不相关的块 | `SIMILARITY_THRESHOLD` | 0.1，可试 0.3 |
+| 换对话模型 | `CHAT_MODEL` | `gpt-6.1-sol` |
+| 换向量模型 | `EMBEDDING_MODEL`、`EMBEDDING_DIMENSIONS` | `qwen3.7-text-embedding`、1024 |
+
+还有几个参数在代码里：
+
 | 想要 | 改什么 | 位置 |
 |---|---|---|
-| 块更大或更小 | `chunk_token_num`，默认 128 | [naive.py 第 205 行](../backend/app/engine/rag/app/naive.py#L205) |
-| 给模型更多或更少参考 | `page_size`，默认 5 | [retrieval.py 第 22 行](../backend/app/services/retrieval.py#L22) |
-| 更看重语义或关键词 | `vector_similarity_weight`，默认 0.6 | [retrieval.py 第 20 行](../backend/app/services/retrieval.py#L20) |
-| 过滤掉不相关的块 | `similarity_threshold`，默认 0.1，可试 0.3 | [search_v2.py 第 297 行](../backend/app/engine/rag/nlp/search_v2.py#L297) |
-| 粗筛时关键词多占一点 | 融合权重 `0.05, 0.95` | [search_v2.py 第 111 行](../backend/app/engine/rag/nlp/search_v2.py#L111) |
-| 关键词匹配更宽松 | `min_match=0.3` | [search_v2.py 第 100 行](../backend/app/engine/rag/nlp/search_v2.py#L100) |
+| 粗筛时关键词多占一点 | 融合权重 `0.05, 0.95` | [search_v2.py 第 124 行](../backend/app/engine/rag/nlp/search_v2.py#L124) |
+| 关键词匹配更宽松 | `min_match=0.3` | [search_v2.py 第 113 行](../backend/app/engine/rag/nlp/search_v2.py#L113) |
 | 文件名和正文的权重 | `title_tks^10`、`content_ltks^2` | [query.py 第 29 行](../backend/app/engine/rag/nlp/query.py#L29) |
-| 换对话模型 | `model="gpt-6.1-sol"`，共三处 | [chat.py 第 355 行](../backend/app/services/chat.py#L355) |
 
-**改了切块、分词、索引相关的参数后，已经上传的文档不会自动更新**，要在知识库页删掉重传。
+**改了切块、分词、向量模型后，已经入库的文档不会自动更新**，执行一次：
+
+```bash
+docker exec -w /app swxy_api python manage.py reindex-all
+```
+
+所有文档会重新排队解析，知识库页上能看到进度。
 
 ---
 
@@ -843,29 +968,31 @@ print('检索语句:', m.matching_text)
 ```bash
 docker exec -w /app swxy_api python -c "
 import logging; logging.disable(logging.CRITICAL)
+from core.config import settings
 from services.retrieval import dealer
-r = dealer.retrieval(question='润本股份的毛利率是多少', embd_mdl=None, tenant_ids='1',
-                     kb_ids=None, vector_similarity_weight=0.6, page=1, page_size=5)
+r = dealer.retrieval(question='润本股份的毛利率是多少', embd_mdl=None, tenant_ids=settings.es_index,
+                     kb_ids=['1'], vector_similarity_weight=0.6, page=1, page_size=5)
 for c in r['chunks']:
     print('总分', round(float(c['similarity']),2), '关键词', round(float(c['term_similarity']),2),
           '重排', round(float(c['vector_similarity']),2), c['content_with_weight'][:40].replace(chr(10),' '))
 "
 ```
 
-`tenant_ids='1'` 是用户 ID，换成你自己的。
+`kb_ids=['1']` 是用户 ID，换成你自己的。
 
-**看 ES 是怎么切词的（验证 2.4 的问题二）：**
+**看 ES 是怎么切词的：**
 
 ```bash
 docker exec swxy_api python -c "
-from elasticsearch import Elasticsearch
-es = Elasticsearch(['http://es01:9200'], basic_auth=('elastic','infini_rag_flow'))
-r = es.indices.analyze(index='1', body={'field':'content_ltks','text':'国电电力 营业 收入'})
+import logging; logging.disable(logging.CRITICAL)
+from core.config import settings
+from engine.rag.utils.es_conn import ESConnection
+r = ESConnection().es.indices.analyze(index=settings.es_index, body={'field':'content_ltks','text':'国电电力 营业 收入'})
 print([t['token'] for t in r['tokens']])
 "
 ```
 
-现在会输出单字。修好之后应该输出 `['国电电力', '营业', '收入']`。
+应该输出 `['国电电力', '营业', '收入']`。
 
 **检查重排接口是否正常：**
 
@@ -876,4 +1003,4 @@ print(rerank_similarity('润本股份的毛利率是多少', ['公司毛利率�
 "
 ```
 
-正常输出一组 0～1 之间的数；如果全是 0 并打印“重排失败”，就是密钥、额度或网络的问题。
+正常输出一组 0～1 之间的数；如果全是 0，日志里会有一条“重排失败”，说明是密钥、额度或网络的问题。

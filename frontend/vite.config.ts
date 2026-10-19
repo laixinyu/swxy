@@ -12,7 +12,9 @@ export default defineConfig(() => {
   return {
     server: {
       port: 5181,
-      host: '0.0.0.0',
+      // 开发服务器会把所有接口转发给后端，监听 0.0.0.0 时公网也能访问。
+      // 只通过 Tailscale 或本机访问时，设成对应地址，例如 DEV_HOST=100.101.76.39
+      host: process.env.DEV_HOST || '0.0.0.0',
       // 麦克风只能在 https 或 localhost 下使用。局域网和 Tailscale 地址走 https。
       https: {
         key: fs.readFileSync(path.join(certDir, 'dev-key.pem')),
@@ -26,7 +28,7 @@ export default defineConfig(() => {
           changeOrigin: true,
           ws: true,
         },
-        '^/(login|register|sts-token|get_files|delete_file|get_messages|get_sessions|create_session|quick_parse|get_parsed_content|chat_on_docs|upload_files|sessions)(/|\\?|$)':
+        '^/(login|register|sts-token|get_files|delete_file|documents|get_messages|get_sessions|create_session|quick_parse|get_parsed_content|chat_on_docs|upload_files|sessions)(/|\\?|$)':
           {
             target: apiTarget,
             changeOrigin: true,

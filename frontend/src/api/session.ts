@@ -22,6 +22,7 @@ export function detail(
       message_id: string
       session_id: string
       user_question: string
+      retrieval_query?: string | null
       model_answer: string
       think?: string
       documents?: string
@@ -109,4 +110,21 @@ export function documents(
     ...options,
     params: _params,
   })
+}
+
+export type SessionScope = {
+  doc_ids: string[]
+  documents: { id: string; file_name: string; status: API.RepositoryStatus }[]
+}
+
+export function getScope(params: { session_id: string }, options?: AxiosRequestConfig) {
+  return request.get<SessionScope>(`/sessions/${params.session_id}/scope`, options)
+}
+
+export function updateScope(
+  params: { session_id: string; doc_ids: string[] },
+  options?: AxiosRequestConfig,
+) {
+  const { session_id, doc_ids } = params
+  return request.put<SessionScope>(`/sessions/${session_id}/scope`, { doc_ids }, options)
 }

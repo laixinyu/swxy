@@ -1,43 +1,48 @@
 import * as api from '@/api'
 import IconDelete from '@/assets/repository/action/delete.svg'
 import IconSearch from '@/assets/repository/search.svg'
-import { PlusOutlined } from '@ant-design/icons'
+import { PlusOutlined, ReloadOutlined } from '@ant-design/icons'
 import { useRequest } from 'ahooks'
 import { Button, Input, Modal, Popconfirm, Space, Table } from 'antd'
 import { ColumnsType } from 'antd/es/table'
 import { TableRowSelection } from 'antd/es/table/interface'
 import dayjs from 'dayjs'
-import { useMemo, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { FileIcon } from './components/file-icon'
 import { Status } from './components/status'
 import RepositoryUpload, { RepositoryUploadRef } from './components/upload'
 import styles from './index.module.scss'
 
 type IRepository = API.Repository & {
-  id: number
   $suffix: FileIcon
-  number: number
   method: string
-  enable: boolean
-  status: string
 }
+
+const POLL_INTERVAL = 3000
 
 export default function Index() {
   const { data, refresh } = useRequest(async () => {
-    const { data } = await api.repository.list()
+    const { data } = await api.repository.list(undefined, { loading: false })
     return data?.map(
-      (item, index) =>
+      (item) =>
         ({
           ...item,
           $suffix: item.file_name.split('.').pop() as FileIcon,
-          id: index + 1,
-          number: 0,
           method: 'General',
-          enable: true,
-          status: 'success',
         }) satisfies IRepository,
     )
   })
+
+  // 有文档还在排队或解析时定时刷新，全部完成后停止
+  const busy = useMemo(
+    () => data?.some((item) => item.status === 'pending' || item.status === 'parsing') ?? false,
+    [data],
+  )
+  useEffect(() => {
+    if (!busy) return
+    const timer = window.setTimeout(refresh, POLL_INTERVAL)
+    return () => window.clearTimeout(timer)
+  }, [busy, data, refresh])
 
   const columns = useMemo<ColumnsType<IRepository>>(
     () => [
@@ -56,7 +61,7 @@ export default function Index() {
       },
       {
         title: '切片数量',
-        dataIndex: 'number',
+        dataIndex: 'chunk_count',
         width: 100,
       },
       {
@@ -76,8 +81,15 @@ export default function Index() {
         title: '状态',
         dataIndex: 'status',
         width: 100,
-        render(value) {
-          return <Status status={value} />
+        render(value, row) {
+          return (
+            <Status
+              status={value}
+              error={row.error}
+              progress={row.progress}
+              progressMsg={row.progress_msg}
+            />
+          )
         },
       },
       {
@@ -87,6 +99,25 @@ export default function Index() {
         render(_, row) {
           return (
             <Space>
+              {(row.status === 'failed' || row.status === 'done') && (
+                <Popconfirm
+                  title={row.status === 'failed' ? '重新解析这个文档？' : '重新解析这个文档？完成之前仍然使用现有的切片。'}
+                  onConfirm={async () => {
+                    await api.repository.reparse({ id: row.id })
+                    refresh()
+                  }}
+                >
+                  <Button
+                    color="default"
+                    variant="text"
+                    shape="circle"
+                    size="small"
+                    title="重新解析"
+                  >
+                    <ReloadOutlined />
+                  </Button>
+                </Popconfirm>
+              )}
               <Popconfirm
                 title="确定要删除该文件吗？"
                 onConfirm={async () => {

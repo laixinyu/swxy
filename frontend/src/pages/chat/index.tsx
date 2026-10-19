@@ -110,6 +110,10 @@ export default function Index() {
               type: ChatType.Document,
               content: item.model_answer,
               think: item.think,
+              retrieval_query:
+                item.retrieval_query && item.retrieval_query !== item.user_question
+                  ? item.retrieval_query
+                  : undefined,
               reference: reference,
               documents: documents?.length ? documents : undefined,
               recommended_questions: recommended_questions?.length
@@ -202,6 +206,13 @@ export default function Index() {
           }
 
           const json = JSON.parse(str)
+          if (json?.error) {
+            target.error = json.error
+            return
+          }
+          if (json?.retrieval_query) {
+            target.retrieval_query = json.retrieval_query
+          }
           if (json?.content) {
             if (json.thinking) {
               target.think = `${target.think || ''}${json.content || ''}`

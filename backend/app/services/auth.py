@@ -1,131 +1,53 @@
-from db.database import get_db, SessionLocal
-from models.user import User
-from common.password import verify_password
-from sqlalchemy.exc import SQLAlchemyError
-from exceptions.auth import AuthError
-from fastapi_jwt import JwtAccessBearerCookie
+import logging
 import secrets
 from datetime import timedelta
-import os
-import logging
-from dotenv import load_dotenv
 
-load_dotenv()
+from fastapi_jwt import JwtAccessBearerCookie
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
 
-# JWT配置
-JWT_SECRET_KEY = os.environ.get('JWT_SECRET_KEY', '').strip()
-if len(JWT_SECRET_KEY) < 32:
-    raise RuntimeError(
-        "JWT_SECRET_KEY 未配置或长度不足 32 位。请在 backend/.env 中设置，可用以下命令生成："
-        "python -c \"import secrets; print(secrets.token_urlsafe(48))\""
-    )
+from common.password import hash_password, verify_password
+from core.config import settings
+from exceptions.auth import AuthError
+from models import User
 
-# 从请求头或cookie中读取访问令牌（优先从请求头读取）
+logger = logging.getLogger(__name__)
+
+# 从请求头或 cookie 中读取访问令牌（优先请求头）。密钥长度由 Settings 校验。
 access_security = JwtAccessBearerCookie(
-    secret_key=JWT_SECRET_KEY,
+    secret_key=settings.jwt_secret_key,
     auto_error=True,
-    access_expires_delta=timedelta(days=2)  # 访问令牌有效期为2天
+    access_expires_delta=timedelta(days=settings.jwt_expire_days),
 )
 
-def create_token(user_id: int, user_name: str, salting: str = ""):
-    # 生成token的主体部分，包含用户名和随机盐值
-    subject = {
-        "user_id": user_id,
-        "user_name": user_name,
-        "salting": secrets.token_hex(16)
-    }
-    
-    # 创建新的访问令牌
-    access_token = access_security.create_access_token(subject=subject)
-    
-    return access_token
+
+_DUMMY_HASH = hash_password(secrets.token_hex(16))
 
 
-def authenticate(username: str, password: str) -> str:
-    """
-    认证用户
-    
-    Args:
-        username (str): 用户名
-        password (str): 明文密码
-    
-    Returns:
-        str: 认证成功返回token，失败返回None
-    
-    Raises:
-        AuthError: 认证失败时抛出
-    """
-    db = next(get_db())
+def create_token(user_id: int, user_name: str) -> str:
+    subject = {"user_id": user_id, "user_name": user_name, "salting": secrets.token_hex(16)}
+    return access_security.create_access_token(subject=subject)
+
+
+def authenticate(db: Session, username: str, password: str) -> str:
+    user = db.query(User).filter(User.username == username).first()
+    # 用户不存在时也做一次完整的哈希校验，避免通过响应时间判断用户名是否存在
     try:
-        # 查询用户
-        user = db.query(User).filter(User.username == username).first()
-        
-        if not user:
-            raise AuthError("认证失败")
-        
-        # 验证密码
-        if not verify_password(password, user.password_hash):
-            raise AuthError("认证失败")
-        
-        # 如果需要生成token，可以在这里实现
-        # return create_token(user.id)
-        return create_token(user.id, user.username)
-    
-    except SQLAlchemyError as e:
-        raise AuthError("认证失败") from e
-    finally:
-        db.close()
+        valid = verify_password(password, user.password_hash if user else _DUMMY_HASH)
+    except ValueError:
+        valid = False
+    if not user or not valid:
+        raise AuthError("用户名或密码错误")
+    return create_token(user.id, user.username)
 
-def register_user(username: str, password: str):
-    """
-    注册新用户
-    
-    Args:
-        username (str): 用户名
-        password (str): 明文密码
-    
-    Raises:
-        AuthError: 如果用户名已存在或注册失败
-    """
-    from common.password import hash_password
-    
-    # 配置日志
-    logging.basicConfig(level=logging.INFO)
-    logger = logging.getLogger(__name__)
-    
-    logger.info(f"开始注册用户: {username}")
-    db = next(get_db())
+
+def register_user(db: Session, username: str, password: str) -> None:
+    if db.query(User.id).filter(User.username == username).first():
+        raise AuthError("用户名已存在")
+    db.add(User(username=username, password_hash=hash_password(password)))
     try:
-        # 检查用户名是否已存在
-        logger.info("检查用户名是否已存在...")
-        existing_user = db.query(User).filter(User.username == username).first()
-        if existing_user:
-            logger.warning(f"用户名 {username} 已存在")
-            raise AuthError("用户名已存在")
-        
-        # 对密码进行哈希处理
-        logger.info("开始密码哈希处理...")
-        password_hash = hash_password(password)
-        logger.info("密码哈希处理完成")
-        
-        # 创建新用户
-        logger.info("创建新用户记录...")
-        new_user = User(username=username, password_hash=password_hash)
-        db.add(new_user)
-        
-        # 提交事务
-        logger.info("提交数据库事务...")
         db.commit()
-        logger.info(f"用户 {username} 注册成功")
-        
-    except SQLAlchemyError as e:
-        logger.error(f"数据库操作失败: {str(e)}")
+    except IntegrityError:
         db.rollback()
-        raise AuthError(f"注册失败: {str(e)}")
-    except Exception as e:
-        logger.error(f"注册过程中发生未知错误: {str(e)}")
-        db.rollback()
-        raise AuthError(f"注册失败: {str(e)}")
-    finally:
-        db.close()
-        logger.info("数据库连接已关闭")
+        raise AuthError("用户名已存在")
+    logger.info("用户 %s 注册成功", username)

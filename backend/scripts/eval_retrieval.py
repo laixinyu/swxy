@@ -10,7 +10,7 @@
 
 在后端容器里运行：
   docker cp backend/scripts/. swxy_api:/tmp/scripts
-  docker exec -w /app swxy_api python /tmp/scripts/eval_retrieval.py /tmp/scripts/eval_set.json --index 1
+  docker exec -w /app swxy_api python /tmp/scripts/eval_retrieval.py /tmp/scripts/eval_set.json --user 1
 """
 import argparse
 import json
@@ -24,21 +24,22 @@ sys.path.insert(0, str(APP_DIR) if APP_DIR.exists() else os.getcwd())
 logging.disable(logging.CRITICAL)
 
 import numpy as np  # noqa: E402
+from core.config import settings  # noqa: E402
 from engine.rag.settings import PAGERANK_FLD  # noqa: E402
 from services.retrieval import dealer  # noqa: E402
 
-# 与 services/retrieval.py、Dealer.retrieval() 的线上取值保持一致
-TOP_K = 5
-CANDIDATES = 128
-VECTOR_WEIGHT = 0.6
-THRESHOLD = 0.1
+# 与线上检索使用同一份配置
+TOP_K = settings.retrieval_top_k
+CANDIDATES = settings.retrieval_candidates
+VECTOR_WEIGHT = settings.vector_similarity_weight
+THRESHOLD = settings.similarity_threshold
 
 
-def rank_of_answer(question, index, case):
-    req = {"kb_ids": None, "doc_ids": None, "size": CANDIDATES, "question": question,
+def rank_of_answer(question, kb_id, case):
+    req = {"kb_ids": [kb_id], "doc_ids": None, "size": CANDIDATES, "question": question,
            "vector": True, "topk": 1024, "similarity": THRESHOLD, "available_int": 1}
     rank_feature = {PAGERANK_FLD: 10}
-    sres = dealer.search(req, [index], None, None, False, rank_feature=rank_feature)
+    sres = dealer.search(req, [settings.es_index], [kb_id], None, False, rank_feature=rank_feature)
     if not sres.ids:
         return None, None, 0
 
@@ -58,7 +59,7 @@ def rank_of_answer(question, index, case):
 def main():
     parser = argparse.ArgumentParser(description="检索评测")
     parser.add_argument("eval_set", help="测试集 JSON 文件路径")
-    parser.add_argument("--index", default="1", help="ES 索引名，也就是用户 ID")
+    parser.add_argument("--user", default="1", help="用户 ID（检索时按它过滤知识库）")
     args = parser.parse_args()
 
     cases = json.loads(Path(args.eval_set).read_text(encoding="utf-8"))
@@ -68,7 +69,7 @@ def main():
 
     print(f"{'结果':<10}{'粗筛名次':>8}{'最终名次':>8}  问题")
     for case in cases:
-        recall_rank, final_rank, total = rank_of_answer(case["question"], args.index, case)
+        recall_rank, final_rank, total = rank_of_answer(case["question"], args.user, case)
 
         if final_rank and final_rank <= TOP_K:
             verdict = "命中"

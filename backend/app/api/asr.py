@@ -1,22 +1,20 @@
 import base64
 import json
 import logging
-import os
 import struct
 
 import httpx
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+
+from core.config import settings
 from services.auth import access_security
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
-ASR_MODEL = os.getenv("ASR_MODEL", "qwen-audio-3.0-asr-flash")
+ASR_MODEL = settings.asr_model
 # 套餐控制台给出的是 compatible-mode 地址；语音识别走同一主机上的多模态接口。
-ASR_BASE_URL = os.getenv(
-    "ASR_BASE_URL",
-    "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
-)
+ASR_BASE_URL = settings.asr_base_url
 MAX_PCM_BYTES = 9_000_000
 
 
@@ -121,7 +119,7 @@ async def asr_proxy(websocket: WebSocket):
         await websocket.close()
         return
 
-    api_key = os.getenv("ASR_API_KEY")
+    api_key = settings.asr_api_key
     if not api_key:
         await websocket.send_json({"type": "error", "message": "未配置语音识别密钥"})
         await websocket.close()

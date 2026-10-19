@@ -76,7 +76,7 @@ export default forwardRef<RepositoryUploadRef, UploadProps>(
             window.$app.message.error(errors?.[0]?.message)
             throw new Error(errors?.[0]?.message)
           } else {
-            window.$app.message.success('上传已完成')
+            window.$app.message.success('上传完成，正在后台解析')
           }
         },
       }

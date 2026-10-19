@@ -15,6 +15,8 @@ declare namespace API {
     error?: string
     content?: string
     think?: string
+    // 结合上下文改写后、实际拿去检索的问题，和用户原问题不同时才有
+    retrieval_query?: string
 
     documents?: Document[]
     reference?: Reference[]

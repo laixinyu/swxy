@@ -53,6 +53,14 @@ function AssistantMessage(props: {
       </div>
 
       <div className={styles['chat-message-item__content']}>
+        {item.retrieval_query ? (
+          <div
+            style={{ color: '#909399', fontSize: 12, marginBottom: 8 }}
+            title="结合前面的对话，把追问补全后再去检索"
+          >
+            按“{item.retrieval_query}”检索
+          </div>
+        ) : null}
         {(() => {
           switch (item.type) {
             case ChatType.Document:

@@ -29,3 +29,11 @@ export function remove(
     params: _params,
   })
 }
+
+export function reparse(params: { id: string }, options?: AxiosRequestConfig) {
+  return request.post<{ id: string; status: API.RepositoryStatus }>(
+    `/documents/${params.id}/reparse`,
+    undefined,
+    options,
+  )
+}

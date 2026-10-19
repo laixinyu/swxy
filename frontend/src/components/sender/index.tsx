@@ -7,6 +7,7 @@ import classNames from 'classnames'
 import { PropsWithChildren, useState } from 'react'
 import './index.scss'
 import Recorder from './recorder'
+import Scope from './scope'
 import Uploader from './uploader'
 
 export default function ComSender(
@@ -60,6 +61,7 @@ export default function ComSender(
               setValue(text)
             }}
           />
+          {sessionId ? <Scope sessionId={sessionId} /> : null}
         </Space>
 
         <Space className="com-sender__actions-right" size={12}>

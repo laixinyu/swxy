@@ -2,7 +2,7 @@ import * as api from '@/api'
 import { PlusCircleOutlined } from '@ant-design/icons'
 import { Button, Upload } from 'antd'
 
-const ACCEPT = ['pdf', 'doc', 'docx', 'txt']
+const ACCEPT = ['pdf', 'docx', 'txt']
 const LIMIT = 10
 
 export default function Uploader(props: {

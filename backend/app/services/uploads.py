@@ -34,18 +34,3 @@ class DocumentUploadService:
         return db.query(DocumentUpload).filter(
             DocumentUpload.session_id == session_id
         ).order_by(DocumentUpload.upload_time.desc()).all()
-    
-    @staticmethod
-    def has_uploaded_documents(db: Session, session_id: str) -> bool:
-        """检查指定会话是否有上传的文档"""
-        count = db.query(DocumentUpload).filter(
-            DocumentUpload.session_id == session_id
-        ).count()
-        return count > 0
-    
-    @staticmethod
-    def get_latest_document(db: Session, session_id: str) -> Optional[DocumentUpload]:
-        """获取指定会话最新上传的文档"""
-        return db.query(DocumentUpload).filter(
-            DocumentUpload.session_id == session_id
-        ).order_by(DocumentUpload.upload_time.desc()).first() 

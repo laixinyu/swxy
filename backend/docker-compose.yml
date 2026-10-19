@@ -1,45 +1,67 @@
-version: '3.8'
+x-backend: &backend
+  build:
+    context: .
+    dockerfile: Dockerfile
+  image: swxy-backend:latest
+  env_file:
+    - .env
+  environment:
+    # 容器之间用服务名访问，覆盖 .env 里给宿主机用的 localhost 地址
+    DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD}@gsk_pg:5432/${POSTGRES_DB:-gsk}
+    ES_HOST: http://es01:9200
+    REDIS_URL: redis://redis:6379/0
+    STORAGE_DIR: /data/files
+    HF_ENDPOINT: https://hf-mirror.com
+  volumes:
+    - ./app:/app
+    - ./nltk_data:/usr/local/nltk_data
+    - file_data:/data/files
+  restart: unless-stopped
+  depends_on:
+    gsk_pg:
+      condition: service_healthy
+    es01:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+  networks:
+    - gsk_network
+
 services:
   swxy_api:
-    build:
-      context: .
-      dockerfile: Dockerfile
+    <<: *backend
     hostname: swxy_api
     container_name: swxy_api
-    environment:
-      - HF_ENDPOINT=https://hf-mirror.com
-      - DATABASE_URL=postgresql://postgres:pg123456@gsk_pg:5432/gsk
-      - ES_HOST=http://es01:9200
-      - ROOT_PATH=http://localhost:8000
-      - REDIS_HOST=redis
-      - REDIS_PORT=6379
-      - REDIS_DB=0
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-    env_file:
-      - .env
     ports:
       # 只监听本机。Docker 发布的端口会绕过 ufw，写成 "8000:8000" 会直接暴露到公网。
       # 前端开发服务器在宿主机上通过 127.0.0.1:8000 访问后端。
       - "127.0.0.1:8000:8000"
-    volumes:
-      - ./app:/app
-      - ./nltk_data:/usr/local/nltk_data
-    command: ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
-    restart: unless-stopped
+    command: ["sh", "-c", "exec uvicorn main:app --host 0.0.0.0 --port 8000 --workers ${API_WORKERS:-2} --timeout-keep-alive 30"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/readyz', timeout=5)"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  swxy_worker:
+    <<: *backend
+    hostname: swxy_worker
+    container_name: swxy_worker
+    # 迁移由 API 容器的 start.sh 执行，worker 等 API 就绪（即迁移完成）后再启动
+    entrypoint: []
+    command: ["python", "worker.py"]
     depends_on:
-      - gsk_pg
-      - es01
-      - redis
-    networks:
-      - gsk_network
+      swxy_api:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
 
   es01:
     container_name: gsk-es-01
     image: docker.elastic.co/elasticsearch/elasticsearch:8.11.3
     volumes:
       - gsk_esdata01:/usr/share/elasticsearch/data
-    env_file: .env
     environment:
       - node.name=es01
       - ELASTIC_PASSWORD=${ELASTIC_PASSWORD}
@@ -51,19 +73,19 @@ services:
       - cluster.routing.allocation.disk.watermark.low=5gb
       - cluster.routing.allocation.disk.watermark.high=3gb
       - cluster.routing.allocation.disk.watermark.flood_stage=2gb
-      - TZ=${TIMEZONE}
-      - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
-    mem_limit: ${MEM_LIMIT}
+      - TZ=${TIMEZONE:-Asia/Shanghai}
+      - "ES_JAVA_OPTS=-Xms${ES_HEAP:-512m} -Xmx${ES_HEAP:-512m}"
+    mem_limit: ${MEM_LIMIT:-2147483648}
     ulimits:
       memlock:
         soft: -1
         hard: -1
     healthcheck:
-      test: ["CMD-SHELL", "curl http://localhost:9200"]
+      test: ["CMD-SHELL", "curl -s -u elastic:$${ELASTIC_PASSWORD} http://localhost:9200/_cluster/health | grep -qv '\"status\":\"red\"'"]
       interval: 10s
       timeout: 10s
       retries: 120
-    restart: on-failure
+    restart: unless-stopped
     networks:
       - gsk_network
 
@@ -71,12 +93,16 @@ services:
     container_name: gsk_pg
     image: postgres:15-alpine
     environment:
-      - POSTGRES_PASSWORD=pg123456
-      - POSTGRES_USER=postgres
-      - POSTGRES_DB=gsk
+      - POSTGRES_USER=${POSTGRES_USER:-postgres}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_DB=${POSTGRES_DB:-gsk}
     volumes:
       - pg_data:/var/lib/postgresql/data
-      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
     restart: unless-stopped
     networks:
       - gsk_network
@@ -84,8 +110,15 @@ services:
   redis:
     container_name: gsk_redis
     image: redis:7-alpine
+    # 入库任务队列在 Redis 里，开启 AOF 避免重启丢任务
+    command: ["redis-server", "--appendonly", "yes"]
     volumes:
       - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
     restart: unless-stopped
     networks:
       - gsk_network
@@ -96,6 +129,8 @@ volumes:
   pg_data:
     driver: local
   redis_data:
+    driver: local
+  file_data:
     driver: local
 
 networks:

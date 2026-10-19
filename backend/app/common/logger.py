@@ -1,44 +1,39 @@
 import logging
+
 import colorlog
-import os
+
+from core.config import settings
+
+_configured = False
 
 
-def get_logger():
-
-    LOG_LEVEL = os.environ.get('LOG_LEVEL', 'DEFAULT')
-
-    #########################
-    ## color logger define ##
-    #########################
-
-    # Handler for logging
+def setup_logging() -> None:
+    """配置根日志，所有模块用 logging.getLogger(__name__) 即可。重复调用无副作用。"""
+    global _configured
+    if _configured:
+        return
     handler = colorlog.StreamHandler()
-    formatter = colorlog.ColoredFormatter(
-        "%(log_color)s%(asctime)s.%(msecs)03d - %(levelname)s - [%(funcName)s] - %(message)s",
-        datefmt='%Y-%m-%d %H:%M:%S',
-        log_colors={
-            'DEBUG': 'cyan',
-            'INFO': 'green',
-            'WARNING': 'yellow',
-            'ERROR': 'red',
-            'CRITICAL': 'red,bg_white',
-        }
+    handler.setFormatter(
+        colorlog.ColoredFormatter(
+            "%(log_color)s%(asctime)s.%(msecs)03d %(levelname)s [%(name)s] %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+            log_colors={
+                "DEBUG": "cyan",
+                "INFO": "green",
+                "WARNING": "yellow",
+                "ERROR": "red",
+                "CRITICAL": "red,bg_white",
+            },
+        )
     )
-    handler.setFormatter(formatter)
+    root = logging.getLogger()
+    root.handlers[:] = [handler]
+    root.setLevel(settings.log_level.upper())
+    for noisy in ("httpx", "elastic_transport", "urllib3", "openai"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
+    _configured = True
 
-    # Logger instance
-    logger = colorlog.getLogger(__name__)
-    logger.addHandler(handler)
 
-    # Logger level
-    LOG_LEVEL_OPTION = {
-        'DEBUG': logging.DEBUG,
-        'INFO': logging.INFO,
-        'WARNING': logging.WARNING,
-        'ERROR': logging.ERROR,
-        'CRITICAL': logging.CRITICAL,
-        'DEFAULT': logging.INFO
-    }
-    logger.setLevel(LOG_LEVEL_OPTION.get(LOG_LEVEL.upper(), 'DEFAULT'))
-
-    return logger
+def get_logger(name: str = "app") -> logging.Logger:
+    setup_logging()
+    return logging.getLogger(name)

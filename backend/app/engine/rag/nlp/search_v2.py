@@ -13,6 +13,7 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 #
+import ast
 import logging
 import re
 from dataclasses import dataclass
@@ -23,8 +24,20 @@ from engine.rag.nlp import rag_tokenizer, query
 import numpy as np
 from engine.rag.utils.doc_store_conn import DocStoreConnection, MatchDenseExpr, FusionExpr, OrderByExpr
 from engine.rag.nlp.model import generate_embedding, rerank_similarity
+from core.config import settings
 
 def index_name(uid): return f"{uid}"
+
+
+def _parse_tag_features(value) -> dict:
+    """getFields 会把存储的字典转成 str()，这里只按字面量解析，不执行代码。"""
+    if isinstance(value, dict):
+        return value
+    try:
+        parsed = ast.literal_eval(value) if value else {}
+    except (ValueError, SyntaxError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
 
 
 class Dealer:
@@ -255,7 +268,7 @@ class Dealer:
         q_denor = np.sqrt(np.sum([s*s for t,s in query_rfea.items() if t != PAGERANK_FLD]))
         for i in search_res.ids:
             nor, denor = 0, 0
-            for t, sc in eval(search_res.field[i].get(TAG_FLD, "{}")).items():
+            for t, sc in _parse_tag_features(search_res.field[i].get(TAG_FLD, "{}")).items():
                 if t in query_rfea:
                     nor += query_rfea[t] * sc
                 denor += sc * sc
@@ -301,7 +314,8 @@ class Dealer:
         ranks = {"total": 0, "chunks": [], "doc_aggs": {}}
 
         RERANK_PAGE_LIMIT = 3
-        req = {"kb_ids": kb_ids, "doc_ids": doc_ids, "size": max(page_size * RERANK_PAGE_LIMIT, 128),
+        req = {"kb_ids": kb_ids, "doc_ids": doc_ids,
+               "size": max(page_size * RERANK_PAGE_LIMIT, settings.retrieval_candidates),
                "question": question, "vector": True, "topk": top,
                "similarity": similarity_threshold,
                "available_int": 1}
@@ -320,7 +334,6 @@ class Dealer:
 
         # 前 RERANK_PAGE_LIMIT 页才做 rerank,后续翻页直接按召回顺序返回
         if page <= RERANK_PAGE_LIMIT and sres.total > 0:
-            print("重排模型。。。。")
             sim, tsim, vsim = self.rerank_by_model(
                 sres, question, 1 - vector_similarity_weight,
                 vector_similarity_weight,

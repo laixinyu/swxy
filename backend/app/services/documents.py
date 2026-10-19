@@ -1,159 +1,107 @@
-from sqlalchemy.orm import Session
-from sqlalchemy import and_
-from models.message import KnowledgeBase
-from engine.rag.utils.es_conn import ESConnection
-import os
+"""知识库文档的增删查。数据库只走 ORM。"""
 import logging
+import uuid
+
+from fastapi import HTTPException
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
+
+from core.config import settings
+from engine.rag.utils.es_conn import ESConnection
+from models import Document, DocumentStatus
+from services import storage
+from services.tasks import enqueue_ingest
 
 logger = logging.getLogger(__name__)
 
-def delete_document(user_id: str, file_name: str, db: Session) -> dict:
-    """
-    删除文档及其相关数据
-    
-    Args:
-        user_id: 用户ID
-        file_name: 文件名
-        db: 数据库会话
-        
-    Returns:
-        包含操作状态的字典
-    """
+
+def list_documents(db: Session, user_id: str) -> list[Document]:
+    return (
+        db.query(Document)
+        .filter(Document.user_id == user_id)
+        .order_by(Document.created_at.desc())
+        .all()
+    )
+
+
+def owned_documents(db: Session, user_id: str, doc_ids: list[str]) -> list[Document]:
+    """只返回属于该用户的文档，别人的文档 ID 会被忽略。"""
+    if not doc_ids:
+        return []
+    return db.query(Document).filter(Document.user_id == user_id, Document.id.in_(doc_ids)).all()
+
+
+def reparse_document(db: Session, user_id: str, doc_id: str) -> Document:
+    doc = db.query(Document).filter(Document.user_id == user_id, Document.id == doc_id).first()
+    if doc is None:
+        raise HTTPException(status_code=404, detail="文档不存在")
+    if doc.status in (DocumentStatus.PENDING, DocumentStatus.PARSING):
+        raise HTTPException(status_code=409, detail="文档正在解析中")
+    doc.status = DocumentStatus.PENDING
+    doc.progress = 0
+    doc.progress_msg = None
+    doc.error = None
+    db.commit()
+    enqueue_ingest(doc.id)
+    db.refresh(doc)
+    return doc
+
+
+def create_document(db: Session, user_id: str, file_name: str, content: bytes) -> Document:
+    """保存文件、写入记录、加入入库队列。解析在后台进行，调用方立即返回。"""
+    ext = storage.file_extension(file_name)
+    if ext not in settings.allowed_extension_set:
+        raise HTTPException(status_code=400, detail=f"不支持的文件类型 .{ext}")
+    storage.validate_content(ext, content)
+
+    if db.query(Document.id).filter(Document.user_id == user_id, Document.file_name == file_name).first():
+        raise HTTPException(status_code=409, detail=f"文件已存在，请勿重复上传: {file_name}")
+
+    doc_id = uuid.uuid4().hex
+    relative = storage.document_path(user_id, doc_id, ext)
+    storage.save_file(relative, content)
+    doc = Document(
+        id=doc_id,
+        user_id=user_id,
+        kb_id=user_id,
+        file_name=file_name,
+        file_type=ext,
+        file_size=len(content),
+        storage_path=relative,
+        status=DocumentStatus.PENDING,
+    )
+    db.add(doc)
     try:
-        # 1. 从数据库中删除记录
-        db_document = db.query(KnowledgeBase).filter(
-            and_(
-                KnowledgeBase.user_id == user_id,
-                KnowledgeBase.file_name == file_name
-            )
-        ).first()
-        
-        if not db_document:
-            return {"status": "error", "message": "Document not found"}
-            
-        # 获取 user_id 作为 ES 索引名（因为 KnowledgeBase 没有 session_id 字段）
-        index_name = user_id
-        
-        # 2. 从 Elasticsearch 中删除数据
-        es_connection = ESConnection()
-        
-        # 先搜索文档，查看实际存在的文档
-        print(f"搜索索引 {index_name} 中的所有文档...")
-        try:
-            search_result = es_connection.es.search(
-                index=index_name,
-                body={
-                    "query": {"match_all": {}},
-                    "size": 100
-                }
-            )
-            print(f"找到 {search_result['hits']['total']['value']} 个文档")
-            
-            # 打印前几个文档的关键字段
-            for i, hit in enumerate(search_result['hits']['hits'][:3]):
-                source = hit['_source']
-                print(f"文档 {i+1}:")
-                print(f"  docnm: {source.get('docnm', 'N/A')}")
-                print(f"  docnm_kwd: {source.get('docnm_kwd', 'N/A')}")
-                print(f"  kb_id: {source.get('kb_id', 'N/A')} (类型: {type(source.get('kb_id', 'N/A'))})")
-                print(f"  doc_id: {source.get('doc_id', 'N/A')}")
-                
-        except Exception as e:
-            print(f"搜索文档失败: {e}")
-        
-        # 检查字段映射
-        try:
-            mapping = es_connection.es.indices.get_mapping(index=index_name)
-            print(f"索引映射信息: {mapping}")
-        except Exception as e:
-            print(f"获取映射失败: {e}")
-        
-        # 尝试删除文档，同时支持字符串和数字类型的 kb_id
-        deleted_count = 0
-        
-        # 准备两种可能的 kb_id 值
-        kb_id_candidates = [user_id]  # 字符串类型
-        try:
-            kb_id_int = int(user_id)
-            if kb_id_int != user_id:  # 避免重复
-                kb_id_candidates.append(kb_id_int)  # 数字类型
-        except ValueError:
-            pass
-        
-        print(f"尝试的 kb_id 候选值: {kb_id_candidates}")
-        
-        # 对每个 kb_id 候选值尝试删除
-        for kb_id_candidate in kb_id_candidates:
-            if deleted_count > 0:
-                break  # 如果已经删除了文档，就不需要继续尝试
-                
-            print(f"尝试使用 kb_id={kb_id_candidate} (类型: {type(kb_id_candidate)}) 删除文档")
-            
-            # 尝试使用 match 查询而不是 term 查询
-            try:
-                delete_query = {
-                    "query": {
-                        "bool": {
-                            "must": [
-                                {"match": {"docnm": file_name}},  # 使用 match 查询
-                                {"term": {"kb_id": kb_id_candidate}}
-                            ]
-                        }
-                    }
-                }
-                
-                print(f"使用 match 查询删除: {delete_query}")
-                
-                response = es_connection.es.delete_by_query(
-                    index=index_name,
-                    body=delete_query,
-                    refresh=True
-                )
-                
-                deleted_count = response["deleted"]
-                print(f"match 查询删除响应: {response}")
-                
-                if deleted_count > 0:
-                    print(f"使用 match 查询成功删除 {deleted_count} 个文档")
-                    break
-                    
-            except Exception as e:
-                print(f"match 查询删除失败: {e}")
-            
-            # 如果 match 查询失败，回退到原来的 term 查询
-            deleted_count = es_connection.delete(
-                condition={
-                    "docnm": file_name,
-                    "kb_id": kb_id_candidate
-                },
-                indexName=index_name,
-                knowledgebaseId=None
-            )
-            
-            if deleted_count > 0:
-                print(f"成功删除 {deleted_count} 个文档")
-                break
-        
-        print(f"从 ES 中删除了 {deleted_count} 个文档")
-        
-        # 3. 删除本地文件（如果有文件路径字段的话）
-        # 注意：KnowledgeBase 模型中没有 file_path 字段，我们需要构造文件路径
-        # 假设文件存储在 storage/file/{user_id}/ 目录下
-        file_path = f"storage/file/{user_id}/{file_name}"
-        if os.path.exists(file_path):
-            os.remove(file_path)
-            print(f"删除本地文件: {file_path}")
-            
-        # 4. 从数据库中删除记录
-        db.delete(db_document)
         db.commit()
-        
-        return {
-            "status": "success",
-            "message": f"Successfully deleted {deleted_count} document(s) from ES and database"
-        }
-        
-    except Exception as e:
+    except IntegrityError:
         db.rollback()
-        logger.error(f"Error deleting document: {str(e)}")
-        return {"status": "error", "message": f"Failed to delete document: {str(e)}"} 
+        storage.delete_file(relative)
+        raise HTTPException(status_code=409, detail=f"文件已存在，请勿重复上传: {file_name}")
+
+    try:
+        enqueue_ingest(doc_id)
+    except Exception:
+        logger.exception("文档 %s 加入入库队列失败", doc_id)
+        doc.status = DocumentStatus.FAILED
+        doc.error = "加入解析队列失败，请删除后重新上传"
+        db.commit()
+    db.refresh(doc)
+    return doc
+
+
+def delete_document(db: Session, user_id: str, file_name: str) -> int:
+    doc = (
+        db.query(Document)
+        .filter(Document.user_id == user_id, Document.file_name == file_name)
+        .first()
+    )
+    if doc is None:
+        raise HTTPException(status_code=404, detail="文档不存在")
+
+    # 先删切片再删记录：中途失败时记录还在，可以重试删除
+    deleted = ESConnection().delete_by_doc(settings.es_index, doc.id)
+    storage.delete_file(doc.storage_path)
+    db.delete(doc)
+    db.commit()
+    logger.info("用户 %s 删除文档 %s，清理 %d 个切片", user_id, file_name, deleted)
+    return deleted

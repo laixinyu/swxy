@@ -19,6 +19,7 @@ if config.config_file_name is not None:
 import sys
 import os
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
+from core.config import settings
 from models import Base
 target_metadata = Base.metadata
 
@@ -40,9 +41,7 @@ def run_migrations_offline() -> None:
     script output.
 
     """
-    url = config.get_main_option("sqlalchemy.url")
-    if url is None:
-        url = os.environ.get("DATABASE_URL", "postgresql://postgres:pg123456@gsk_pg:5432/gsk")
+    url = config.get_main_option("sqlalchemy.url") or settings.database_url
     context.configure(
         url=url,
         target_metadata=target_metadata,
@@ -62,9 +61,8 @@ def run_migrations_online() -> None:
 
     """
     configuration = config.get_section(config.config_ini_section, {})
-    if "sqlalchemy.url" not in configuration:
-        configuration["sqlalchemy.url"] = os.environ.get("DATABASE_URL", "postgresql://postgres:pg123456@gsk_pg:5432/gsk")
-    
+    configuration.setdefault("sqlalchemy.url", settings.database_url)
+
     connectable = engine_from_config(
         configuration,
         prefix="sqlalchemy.",
