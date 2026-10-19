@@ -8,9 +8,17 @@ import secrets
 from datetime import timedelta
 import os
 import logging
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # JWT配置
-JWT_SECRET_KEY = os.environ.get('JWT_SECRET_KEY', 'default_secret_key') + 'happy'
+JWT_SECRET_KEY = os.environ.get('JWT_SECRET_KEY', '').strip()
+if len(JWT_SECRET_KEY) < 32:
+    raise RuntimeError(
+        "JWT_SECRET_KEY 未配置或长度不足 32 位。请在 backend/.env 中设置，可用以下命令生成："
+        "python -c \"import secrets; print(secrets.token_urlsafe(48))\""
+    )
 
 # 从请求头或cookie中读取访问令牌（优先从请求头读取）
 access_security = JwtAccessBearerCookie(

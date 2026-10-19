@@ -1,5 +1,7 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from authlib.jose.errors import JoseError
 from api import asr, chat, user, history
 import os
 
@@ -16,6 +18,11 @@ app.add_middleware(
     allow_methods=["*"],  # 允许所有方法
     allow_headers=["*"],  # 允许所有头
 )
+
+# fastapi-jwt 0.3.0 只把过期、格式错误转成 401，签名不对时 Authlib 抛出的 BadSignatureError 会变成 500。
+@app.exception_handler(JoseError)
+async def invalid_token_handler(request: Request, exc: JoseError):
+    return JSONResponse(status_code=401, content={"detail": "Invalid token"})
 
 app.include_router(chat.router)
 app.include_router(user.router)
