@@ -83,6 +83,11 @@ def naive_merge_docx(sections, chunk_token_num=128, delimiter="\n。；！？"):
     return cks, images
 
 
+def _tag_pages(pos):
+    m = re.match(r"@@([0-9-]+)\t", pos or "")
+    return [int(p) for p in m.group(1).split("-")] if m else []
+
+
 def naive_merge(sections, chunk_token_num=128, delimiter="\n。；！？"):
     if not sections:
         return []
@@ -90,16 +95,22 @@ def naive_merge(sections, chunk_token_num=128, delimiter="\n。；！？"):
         sections = [(s, "") for s in sections]
     cks = [""]
     tk_nums = [0]
+    last_page = None
 
     def add_chunk(t, pos):
-        nonlocal cks, tk_nums, delimiter
+        nonlocal cks, tk_nums, delimiter, last_page
         tnum = num_tokens_from_string(t)
+        pages = _tag_pages(pos)
+        # 解析器已经把跨页续写的段落合成一个框，这里换页就是内容换了，不能拼进同一块
+        new_page = bool(pages) and last_page is not None and pages[0] != last_page
+        if pages:
+            last_page = pages[-1]
         if not pos:
             pos = ""
         if tnum < 8:
             pos = ""
         # Ensure that the length of the merged chunk does not exceed chunk_token_num  
-        if tk_nums[-1] > chunk_token_num:
+        if tk_nums[-1] > chunk_token_num or new_page:
 
             if t.find(pos) < 0:
                 t += pos

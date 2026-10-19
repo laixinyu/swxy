@@ -15,6 +15,8 @@
 #
 
 import logging
+from bisect import bisect_right
+from itertools import groupby
 from tika import parser
 from io import BytesIO
 from docx import Document
@@ -154,10 +156,27 @@ class Pdf(PdfParser):
         # self._naive_vertical_merge()
         self._concat_downward()
         # self._filter_forpages()
+        self.boxes = self.order_by_column(self.boxes)
 
         logging.info("layouts cost: {}s".format(timer() - first_start))
         return [(b["text"], self._line_tag(b, zoomin))
                 for b in self.boxes], tbls
+
+    @staticmethod
+    def order_by_column(boxes, min_gap=15):
+        """框默认按从上到下排序，双栏页会左右交替。一页里有一条竖直空隙没有任何框跨过时，按栏从左到右读。"""
+        ordered = []
+        for _, page in groupby(boxes, key=lambda b: b["page_number"]):
+            page = list(page)
+            spans = sorted((b["x0"], b["x1"]) for b in page if b["text"].strip())
+            cuts = []
+            reach = spans[0][1] if spans else 0
+            for x0, x1 in spans[1:]:
+                if x0 - reach >= min_gap:
+                    cuts.append((reach + x0) / 2)
+                reach = max(reach, x1)
+            ordered.extend(sorted(page, key=lambda b: bisect_right(cuts, b["x0"])) if cuts else page)
+        return ordered
 
 
 class Markdown(MarkdownParser):
